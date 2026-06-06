@@ -3,3 +3,7 @@ node_modules/
 
 # Compiled standalone binary (built on the Pi by install.sh)
 /ankermanager
+
+# Playwright artefacts
+test-results/
+playwright-report/
