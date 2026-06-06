@@ -88,6 +88,13 @@ The script will:
 If your printer doesn't like the default gadget, re-run with the composite
 driver: `sudo ./install.sh g_multi` (see [Troubleshooting](#troubleshooting)).
 
+> **Tip — keep an SSH-over-USB escape hatch.** Passing `g_multi` makes the Pi
+> present **mass storage + a USB ethernet adapter + a serial console** all at
+> once. The ethernet adapter means you can SSH into the Pi over the USB cable
+> even when WiFi is misbehaving — invaluable for debugging. The tradeoff is
+> some printers refuse the composite gadget; if yours does, fall back to the
+> default `g_mass_storage`.
+
 ### 3. Connect to the printer
 
 The Pi presents itself as a USB **device** through its **micro-USB data port**
