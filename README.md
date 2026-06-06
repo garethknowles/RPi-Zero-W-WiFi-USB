@@ -1,387 +1,183 @@
-# Introduction
+# RPi Zero W WiFi USB — with a web file manager
 
-## Goal
+Turn a Raspberry Pi Zero 2 W into a **virtual USB drive for your 3D printer**
+that you manage over WiFi from a **browser**: list, upload (drag & drop), create
+folders and delete files — without ever plugging/unplugging a real USB stick.
 
-The goal is to use a Raspberry Pi Zero / Zero 2 W as a USB Drive (for example, for your 3D printer) while being able to access it from your laptop or through Wi-Fi, as a network drive. In the case of a 3D printer, in this way you can export g-code to the shared folder and a couple of seconds later, it will be available to your device.
+Originally built for printers that only read from USB (e.g. the **AnkerMake M5**,
+which has no proper file management of its own). The Pi pretends to be a USB
+stick; you drop a `.gcode`/`.acode` file in the web UI, and a few seconds later
+it shows up on the printer.
 
-In case of Anycubic printers that can use their Mobile app, you can then directly initiate a print from it.
+> **DISCLAIMER:** Use at your own risk. This worked for the authors, but it may
+> not work for you, and you are responsible for any damage to your hardware
+> (Pi or printer).
 
-In general, you only have to select the file on your printer and that's it! No more plugging and unplugging the USB Stick!
+---
 
-**DISCLAIMER** : _I tried, tested and am currently using this setup but there may be a lot of reasons why it may not work for you. I also accept absolutely no responsibility in case something goes wrong, and you break any of your hardware, including the Raspberry Pi or your 3D printer. Do this at your own risk!_
+## How it works
 
-## Demo
-[RPi WiFi USB - PrusaSlicer_.webm](https://github.com/mrfenyx/RPi-Zero-W-WiFi-USB/assets/2023454/e220b13b-e857-4b3c-88e2-5ac9519e6986)
+| Piece | Role |
+|-------|------|
+| `/piusb.bin` | A large (default **50 GB**, sparse) file, formatted **FAT32**, that *is* the "USB stick" |
+| `g_mass_storage` USB gadget | Presents `/piusb.bin` to the printer over the Pi's micro-USB **data** port |
+| `/mnt/usb_share` | The same image loop-mounted on the Pi so files can be read/written |
+| **`ankermanager`** | A single self-contained app (TypeScript, built with [Bun](https://bun.sh)) that serves the **web UI** *and* "replugs" the virtual USB whenever files change, so the printer re-reads them |
+| Samba `[usb]` share | Optional: also exposes `/mnt/usb_share` as a network drive (`\\<pi>\usb`) |
+
+`ankermanager` replaces the older Python watchdog — it's one binary, one systemd
+service, no Python. See [`PLAN.md`](PLAN.md) for the full design and rationale.
+
+---
 
 ## Bill of Materials
 
-- Raspberry Pi Zero W or Zero 2 W
-- 2x Micro USB to USB cables
-- Power supply for the Raspberry Pi
-- Micro-SD Card for Raspberry Pi (preferably 16 GB)
-- OPTIONAL: Raspberry Pi Zero W Case
+- **Raspberry Pi Zero 2 W** (the 64-bit quad-core model — see the note below)
+- A **64 GB or larger** micro-SD card (for a 50 GB virtual drive)
+- Power supply for the Pi
+- A cable to connect the Pi to your printer:
+  - **AnkerMake M5:** its media port is **USB-C** (no USB-A, no SD slot), so you
+    need a **USB-C → micro-USB** cable, from the printer to the Pi's **data**
+    (inner, "USB") micro-USB port. See [Connecting to the printer](#connecting-to-the-printer).
+- Optional: a Pi Zero case
 
-## Preparing the Raspberry Pi
+> **Why a Zero 2 W and 64-bit OS?** `ankermanager` runs on Bun, which only ships
+> 64-bit-ARM Linux builds. The Zero 2 W is 64-bit capable; flash **Raspberry Pi
+> OS Lite (64-bit)**. (The original single-core Zero W v1 is 32-bit only and is
+> not supported by this version.)
 
-1. Use the Raspberry Pi Imager or tool of choice to get the latest Raspberry Pi OS on the SD Card. Make sure you use the 32-bit Lite version!
-2. There are plenty of guides how to get this done, including remote access through SSH (needed!)
-3. Perform first boot, log through SSH and ensure you have access to the OS.
-4. Optional but recommended: perform a system update
+---
+
+## Setup
+
+### 1. Flash the SD card
+
+Use **Raspberry Pi Imager** and choose **Raspberry Pi OS Lite (64-bit)**.
+In Imager's advanced settings (the gear icon / `Ctrl+Shift+X`):
+
+- Set a **hostname** (e.g. `ankermake`)
+- **Enable SSH**
+- Enter your **WiFi SSID + password** and country
+- Set a username/password
+
+Boot the Pi, then connect over SSH:
 
 ```bash
-sudo apt update && sudo apt upgrade -y
+ssh <user>@ankermake.local
 ```
 
-# Automated Setup
-In order to perform the setup automatically, you will have to do a few manual steps to checkout this repository and run the installation script.
+### 2. Run the installer
+
 ```bash
-sudo apt update
-sudo apt install git -y
-git clone https://github.com/mrfenyx/RPi-Zero-W-WiFi-USB.git
-cd RPi-Zero-W-WiFi-USB
-sudo chmod +x install.sh
+sudo apt update && sudo apt install -y git
+git clone https://github.com/garethknowles/rpi-zero-w-wifi-usb.git
+cd rpi-zero-w-wifi-usb
 sudo ./install.sh
 ```
-While the script is doing it's thing, you will still have to [fix the USB data cable](#fixing-the-usb-data-cable).
 
-Once that is done, just hang back and watch the work happen. 
+The script will:
 
-**NOTE:** This will probably take a while. Depending on how many updates the system needs to install, anywhere from 30-60 minutes, maybe even more.
+1. Install packages (Samba, Avahi/mDNS, dosfstools).
+2. Enable the USB gadget driver (`dwc2`).
+3. Create the **50 GB sparse** FAT32 image and loop-mount it at `/mnt/usb_share`.
+4. Configure the optional Samba share.
+5. Install **Bun** and build the `ankermanager` binary to `/usr/local/bin`.
+6. Prompt you for a **web username/password**.
+7. Install and start **`ankermanager.service`** (auto-starts on every boot).
 
-When all is done, the USB cable is "fixed" and the setup is finished, you can navigate to `\\<RPi_IP>\usb` on your PC and you should see an empty folder where you can drop your first .gcode file ;) 
+If your printer doesn't like the default gadget, re-run with the composite
+driver: `sudo ./install.sh g_multi` (see [Troubleshooting](#troubleshooting)).
 
-# Manual Setup
+### 3. Connect to the printer
 
-If you want to do the setup manually, perform the steps below. This will also allow you to perform some checks from time to time and explains what is happening in more detail.
+The Pi presents itself as a USB **device** through its **micro-USB data port**
+(the inner port, often labelled **USB** — *not* **PWR**). Your printer's port is
+the **host**.
 
-## Enabling the USB Driver
+- **AnkerMake M5 (USB-C host):** use a **USB-C → micro-USB** cable from the
+  printer's USB-C port to the Pi's **USB** (data) port.
+- **Power:** power the Pi from its **own** supply via the **PWR** port. To stop
+  the printer and the Pi's supply both feeding 5 V down the data cable, use a
+  **data cable with the 5 V (VBUS) line disconnected** — the equivalent of the
+  classic [tape-the-5V-pin trick](https://community.octoprint.org/t/put-tape-on-the-5v-pin-why-and-how/13574).
+  Do **not** assume the printer's USB-C port can cleanly power the Pi.
 
-This will ensure that the Raspberry Pi can act as a USB device and is being recognized as such by your laptop or 3D Printer.
+### 4. Reboot and use it
 
-You will have to edit some configuration files.
-```bash
-sudo nano /boot/config.txt
+After the installer reboots the Pi, open:
+
 ```
-Scroll to the last line of the file and add the following line:
-```
-dtoverlay=dwc2
-```
-Close and save (CTRL+X, press Y and Enter)
-
-Next, edit the modules file:
-```bash
-sudo nano /etc/modules
-```
-At the end of the file add this:
-```
-dwc2
-```
-Close and save (CTRL+X, press Y and Enter)
-
-Next, you will make sure the USB driver is enabled on boot.
-```bash
-sudo nano /boot/cmdline.txt
-```
-This is a bit tricky. You will need to add the text below **at the end of the existing line (don't add a new line!)** Make sure there is a space between the last command and this one. At the end of the line there should be a space and after the command line, an empty line.
-```
-modules-load=dwc2
-```
-**OPTIONAL** : disable power saving for wlan
-```bash
-sudo iw wlan0 set power_save off
-```
-## "Fixing" the USB Data Cable
-
-Normally a USB cable also provides current to the device that is connected to the port. In order to ensure there is no interference between the Raspberry Pi and your printer, you need to ensure that there is no current flowing through the cable used to connect them. To do this, follow this tutorial: [https://community.octoprint.org/t/put-tape-on-the-5v-pin-why-and-how/13574](https://community.octoprint.org/t/put-tape-on-the-5v-pin-why-and-how/13574)
-Once this is done, you can connect this cable to the Data port on the Raspberry Pi (NOT the power port!) and the other end, for now, to your laptop / PC.
-
-**NOTE: Powering the Pi from your printer**
-
-If your printer is capable of providing a stable 5V power ( and your PC while testing ), and you only need access to the network drive while the printer is turned on, you can use a single "normal" cable connected from the printer to the DATA usb plug on the Raspberry Pi Zero. With this setup, if you power-off your printer, then the whole Raspberry Pi will turn off as well, so you can only access the network drive while your printer is online.
-
-## Creating a USB File
-
-Next, you need to create a file that will contain the data you want to share with the printer.
-```bash
-sudo dd bs=1M if=/dev/zero of=/piusb.bin count=2048
-```
-**NOTE** : the last parameter, "count" determines the size of the "USB Drive" in MBs. In the code above, it will be 2GB. If you want it bigger, go bigger but leave some free space on the SD Card 😉.
-
-Once the file is created, you need to format it so that the printer can read it.
-```bash
-sudo mkdosfs /piusb.bin -F 32 -I
-```
-## Mounting the USB File
-
-Start by creating a folder for the mount:
-```bash
-sudo mkdir /mnt/usb_share
-```
-Just to make sure permissions are not an issue:
-```bash
-sudo chmod 777 /mnt/usb_share/
-```
-Next, you need to add it to fstab
-```bash
-sudo nano /etc/fstab
-```
-Add this to the end of the file:
-```bash
-/piusb.bin /mnt/usb_share vfat users,umask=000 0 2
-```
-Close and save (CTRL+X, press Y and Enter)
-
-Manually reload fstab
-```bash
-sudo mount -a
-```
-## Testing the USB Mounting / Unmounting
-
-To simulate connecting the USB, execute this:
-```bash
-sudo /sbin/modprobe g_multi file=/piusb.bin stall=0 removable=1
-```
-At this point, a new _USB Drive_ should be visible in your file explorer.
-
-To disconnect it, run this:
-```bash
-sudo /sbin/modprobe g_multi -r
-```
-The drive should disappear. Running the first command again will reconnect it.
-
-If this works, you're good so far 😉
-
-## Configuring Samba for Remote File Access
-
-In the next steps you will make the folder available on the network. This way you can drop files there from your laptop / PC. You will use Samba for this. Install it:
-```bash
-sudo apt-get update
-sudo apt-get install samba winbind -y
-```
-Next, you need to configure it. Edit the configuration file.
-```bash
-sudo nano /etc/samba/smb.conf
-```
-You need to add the lines below, which create a new network share:
-```bash
-[usb]
-
-browseable = yes
-path = /mnt/usb_share
-guest ok = yes
-read only = no
-create mask = 777
-directory mask = 777
-```
-Close and save (CTRL+X, press Y and Enter)
-
-Restart the Samba service
-```bash
-sudo systemctl restart smbd.service
-```
-## Accessing the folder from you PC
-
-Find the IP of the Raspberry Pi (for example, running ifconfig on the RasPi). Then, on your PC go to \\\\<RPi\_IP\> and you should see one shared folder called "usb".
-
-## Making the Magic Happen – Automated USB Device Reconnect
-
-In order to see changes, the USB needs to be disconnected and reconnected after a change. Since the whole point is to not do this physically, you will need to create a script using a so-called watchdog to do it for you. You will use Python for this. First, install it and the watchdog that looks for changes:
-```bash
-sudo apt-get install python3-pip
-sudo apt-get install python3-watchdog
-```
-Next, create a file to contain the script needed to make magic:
-```bash
-sudo nano /usr/local/share/usbshare.py
-```
-Inside this file, paste the following code:
-
-```python
-#!/usr/bin/python3
-import time
-import os
-import subprocess
-import logging
-from watchdog.observers import Observer
-from watchdog.events import *
-
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)  # Set to logging.INFO to reduce verbosity
-logger = logging.getLogger(__name__)
-
-CMD_MOUNT = "sudo /sbin/modprobe g_multi file=/piusb.bin stall=0 removable=1"
-CMD_UNMOUNT = "sudo /sbin/modprobe g_multi -r"
-CMD_SYNC = "sync"
-
-WATCH_PATH = "/mnt/usb_share"
-ACT_EVENTS = [DirDeletedEvent, DirMovedEvent, FileDeletedEvent, FileModifiedEvent, FileMovedEvent]
-ACT_TIME_OUT = 5   # This is the time in seconds that the watchdog waits after a change is detected. Usually, if you just save a g-code file this is enough.
-
-class DirtyHandler(FileSystemEventHandler):
-    def __init__(self):
-        self.reset()
-        logger.debug("DirtyHandler initialized.")
-
-    def on_any_event(self, event):
-        if type(event) in ACT_EVENTS:
-            self._dirty = True
-            self._dirty_time = time.time()
-            logger.debug(f"Event detected: {event}. Marking as dirty.")
-
-    @property
-    def dirty(self):
-        return self._dirty
-
-    def dirty_time(self):
-        return self._dirty_time
-
-    def reset(self):
-        self._dirty = False
-        self._dirty_time = 0
-        self._path = None
-        logger.debug("DirtyHandler reset.")
-
-def run_command(command):
-    try:
-        result = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        logger.debug(f"Output of {command}: {result.stdout}")
-        logger.debug(f"Error of {command}, if any: {result.stderr}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error executing {command}: {e}")
-
-# Unmount & Mount the device
-logger.debug("Unmounting the device.")
-run_command(CMD_UNMOUNT)
-logger.debug("Mounting the device.")
-run_command(CMD_MOUNT)
-
-evh = DirtyHandler()
-observer = Observer()
-observer.schedule(evh, path=WATCH_PATH, recursive=True)
-observer.start()
-logger.debug("Observer started to monitor the path.")
-
-try:
-    while True:
-        if evh.dirty:
-            time_out = time.time() - evh.dirty_time()
-            logger.debug(f"Change detected. Timeout: {time_out}s.")
-
-            if time_out >= ACT_TIME_OUT:
-                logger.debug("Timeout exceeded. Unmounting the device.")
-                run_command(CMD_UNMOUNT)
-                time.sleep(1)
-                logger.debug("Syncing after unmounting.")
-                run_command(CMD_SYNC)
-                time.sleep(1)
-                logger.debug("Remounting the device.")
-                run_command(CMD_MOUNT)
-                evh.reset()
-
-            time.sleep(1)
-        else:
-            logger.debug("No changes detected. Sleeping for 1 second.")
-            time.sleep(1)
-
-except KeyboardInterrupt:
-    logger.debug("KeyboardInterrupt received. Stopping observer.")
-    observer.stop()
-    observer.join()
-    logger.debug("Observer stopped and joined.")
+http://ankermake.local/      (or http://<pi-ip>/)
 ```
 
-Close and save (CTRL+X, press Y and Enter)
+Log in, then **drag & drop** a `.gcode`/`.acode` file. Within ~10–15 seconds it
+appears on the printer's USB menu.
 
-You could now test to see if the script works. To start it manually, run this:
-```bash
-sudo python /usr/local/share/usbshare.py
-```
-You should see some log outputs in the console. Now open the network share and add a new file. The console should say that a change was detected. After 5 seconds, the USB drive gets unmounted, then re-mounted. On the USB Drive you should see the added file after about 10-15 seconds.
+> **AnkerMake M5 note:** keep printable files in the **root** of the drive — the
+> M5 may not browse sub-folders. Use folders only for your own archiving, and
+> avoid changing files during an active print.
 
-To stop the script execution, **press CTRL + C**.
+---
 
-## Making the Script into a Service
+## The web UI
 
-You want this script to run as a service, every time the Raspberry Pi reboots. To do this, create a new service file:
-```bash
-sudo nano /etc/systemd/system/usbshare.service
-```
-Add the following lines to it:
-```bash
-[Unit]
+- **List & browse** files and folders (breadcrumb navigation).
+- **Upload** by drag & drop or the Upload button (with a progress bar).
+- **New folder** and **Delete** (files or whole folders).
+- **Download** a file back to your computer.
+- A status bar shows free space and a "syncing to printer…" indicator after a
+  change.
 
-Description=Watchdog for USB Share
-After=multi-user.target
+It's protected by HTTP Basic Auth (set during install). **Keep it on your LAN —
+do not port-forward it to the internet.**
 
-[Service]
+### Configuration
 
-Type=idle
-ExecStart=/usr/bin/python /usr/local/share/usbshare.py
+Settings live in `/etc/ankermanager.env` (read by the systemd service):
 
-[Install]
-WantedBy=multi-user.target
-```
-Close and save (CTRL+X, press Y and Enter)
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `FM_ROOT` | `/mnt/usb_share` | Folder the app manages |
+| `FM_PORT` | `80` | Web UI port |
+| `FM_DRIVER` | `g_mass_storage` | USB gadget driver (`g_mass_storage` or `g_multi`) |
+| `FM_USB_IMAGE` | `/piusb.bin` | The FAT32 image file |
+| `FM_USER` / `FM_PASS` | — | Web login (empty `FM_USER` disables auth) |
+| `FM_DEBOUNCE_MS` | `5000` | Wait after a change before replugging the USB |
 
-Reload the systemctl daemon to make the new service visible to the system:
-```bash
-sudo systemctl daemon-reload
-```
-Finally, enable the service:
-```bash
-sudo systemctl enable usbshare.service
-```
-## Reboot and see if it works
+After editing it: `sudo systemctl restart ankermanager`.
 
-This is it! Now, reboot your Raspberry Pi:
-```bash
-sudo reboot
-```
-After about 1 minute, the system should be back online. You should see the USB Drive and the Network share. Consider mapping the share as a network drive. If this works, connect the Raspberry Pi to your Printer's USB port.
+Logs: `journalctl -u ankermanager -f`
 
-To test things out, open your favourite slicer, generate some g-code and save it to the network drive. In about 10-20 seconds, the code should be visible in your printer, on the USB drive.
-
-If it works, good job! 👏🥂🥳🎉🎊
-
-If not, I'm sorry! 😢😭😿
+---
 
 ## Troubleshooting
-### g_multi driver vs g_mass_storage driver
-Some printers may not work with the g_multi driver, which produces a "single USB configuration with RNDIS[1] (that is Ethernet), USB CDC[2] ACM (that is serial) and USB Mass Storage functions."
-If this is the case, and your files do not show up on your printer using the install script, you can use this troubleshooting.
-Open an SSH shell to your pi, and run `sudo dmesg -w` and watch if this log gets printed repeatedly, it is just looping on this, then it means the printer will not use this USB device.
-```
-[167504.484474] dwc2 20980000.usb: new device is full-speed
-[167504.648298] dwc2 20980000.usb: new device is full-speed
-[167504.686546] dwc2 20980000.usb: new address 1
-```
-If this is the case, reinstall the service using the g_mass_storage driver, or manually update the script above, replacing 'g_multi' with 'g_mass_storage'.
-```
-sudo ./install.sh g_mass_storage
-```
-If you are watching `sudo dmesg -w` in another ssh session, you will see this change drivers, and hopefully will work for you. It shoudl stop repeating the device connected messages, and only have 1 record.
+
+### Files don't appear on the printer
+Some printers reject the composite `g_multi` gadget (which also exposes
+Ethernet/serial). Watch `sudo dmesg -w` while plugged in; if you see the device
+repeatedly re-enumerating ("new device is full-speed" on a loop), switch to the
+plain mass-storage gadget:
+
+```bash
+sudo ./install.sh g_mass_storage   # this is already the default
 ```
 
-[171127.975803] dwc2 20980000.usb: new address 1
-[171134.612520] dwc2 20980000.usb: new device is full-speed
-[171134.776381] dwc2 20980000.usb: new device is full-speed
-[171134.814604] dwc2 20980000.usb: new address 1
-[171141.451306] dwc2 20980000.usb: new device is full-speed
-[171141.615170] dwc2 20980000.usb: new device is full-speed
-[171141.653405] dwc2 20980000.usb: new address 1
-[171144.695230] systemd-fstab-generator[7154]: Checking was requested for "/piusb.bin", but it is not a device.
-[171152.437209] systemd-fstab-generator[7184]: Checking was requested for "/piusb.bin", but it is not a device.
-[171160.014422] systemd-fstab-generator[7219]: Checking was requested for "/piusb.bin", but it is not a device.
-[171167.303899] systemd-fstab-generator[7240]: Checking was requested for "/piusb.bin", but it is not a device.
-[171171.961745] Mass Storage Function, version: 2009/09/11
-[171171.961781] LUN: removable file: (no medium)
-[171171.961961] LUN: removable file: /piusb.bin
-[171171.961983] Number of LUNs=1
-[171171.971615] g_mass_storage gadget.0: Mass Storage Gadget, version: 2009/09/11
-[171171.971653] g_mass_storage gadget.0: userspace failed to provide iSerialNumber
-[171171.971668] g_mass_storage gadget.0: g_mass_storage ready
-[171171.971685] dwc2 20980000.usb: bound driver g_mass_storage
-[171172.236378] dwc2 20980000.usb: new device is full-speed
-[171172.400195] dwc2 20980000.usb: new device is full-speed
-[171172.438425] dwc2 20980000.usb: new address 1
-```
+`g_mass_storage` presents a single, standard USB stick and is the most
+compatible choice.
+
+### Resize the virtual drive
+Stop the service, remove `/piusb.bin`, edit `USB_SIZE_GB` at the top of
+`install.sh`, and re-run it (this **erases** the virtual drive). Keep some free
+space on the SD card. Note FAT32's 4 GB-per-file limit (irrelevant for gcode).
+
+### Reach it by name
+The installer sets up Avahi/mDNS so `http://<hostname>.local/` works. On Windows
+this needs Bonjour (often already installed); otherwise use the Pi's IP address.
+
+---
+
+## Credits
+
+Builds on the original "Pi as a WiFi USB drive" project, replacing the Python
+watchdog with a single TypeScript/Bun app that adds the browser-based file
+manager. See [`PLAN.md`](PLAN.md) for the design.

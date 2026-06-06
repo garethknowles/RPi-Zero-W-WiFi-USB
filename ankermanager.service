@@ -1,0 +1,18 @@
+[Unit]
+Description=AnkerMake WiFi File Manager (web UI + USB replug)
+# Wait for the network and for the FAT32 image to be loop-mounted before starting.
+After=network-online.target mnt-usb_share.mount
+Wants=network-online.target
+Requires=mnt-usb_share.mount
+
+[Service]
+Type=simple
+# Config + web credentials live here (written by install.sh).
+EnvironmentFile=/etc/ankermanager.env
+# Runs as root: needs modprobe to load/unload the USB gadget and to bind port 80.
+ExecStart=/usr/local/bin/ankermanager
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
