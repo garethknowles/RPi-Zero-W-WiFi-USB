@@ -31,16 +31,39 @@ overlay, fstab loop-mount, Samba) is **already done by `install.sh`** and we kee
 all of it. What we change is the **software layer on top**: one Bun/TypeScript
 program that serves the web UI, watches the folder, and does the replug.
 
-### AnkerMake M5 specifics (assumptions — verify on first run)
-- The M5 has a USB-A port and can **print from a USB drive**; AnkerMake Studio
-  produces `.gcode` and `.acode` files. The app/slicer can push a one-off job over
+### AnkerMake M5 specifics (researched — see §1.1 for sources)
+- **Port: USB-C, not USB-A.** The M5 has **no SD-card slot and no USB-A port** —
+  its only removable-media port is a **USB-C** socket on the side, acting as a USB
+  **host**. (Reviewers note this is unusual and that no USB-C stick is included.)
+  This drives the cabling in §6.1.
+- **File types:** the M5 prints **G-code** (`.gcode`); AnkerMake Studio (its
+  slicer) also outputs **`.acode`**. The app/slicer can push a one-off job over
   WiFi but offers **no file management** — exactly the gap we fill.
-- The M5 should accept our virtual stick like any FAT32 USB drive. **To verify:**
-  whether it lists files in **sub-folders** or only the **root** of the drive.
-  This changes nothing in the code — only how you organise files.
+- **Filesystem: use FAT32.** No official page could be confirmed to state FAT32 vs
+  exFAT, but FAT32 is the safe, universally accepted choice (and what this repo's
+  image already uses). Treat exFAT as unconfirmed — don't rely on it. Our virtual
+  stick enumerates as a standard USB mass-storage device, so the M5 should accept
+  it like any FAT32 drive.
+- **Keep printable files in the ROOT of the drive.** Whether the M5 browses
+  **sub-folders** is unconfirmed and printers of this class commonly list only the
+  root. So: keep things you want to print in the drive root; use folders only for
+  your own archiving. **Verify on first run** — this changes nothing in the code,
+  only how you organise files.
 - FAT32 limits: 4 GB max per file (irrelevant for gcode); total capacity is the
   image size — we'll default this to **~50 GB** (see §7), so you'll want a
   **64 GB or larger SD card**.
+
+### 1.1 Research notes & confidence
+| Claim | Confidence | Basis |
+|---|---|---|
+| M5 uses a **USB-C** host port; no USB-A / no SD slot | **High** | Multiple independent reviews (Tom's Hardware, All3DP, TechRadar) |
+| Prints `.gcode`; AnkerMake Studio also makes `.acode` | **High** | AnkerMake docs/slicer + user confirmation |
+| Drive should be **FAT32** | **Medium** | No source confirmed exFAT; FAT32 is the universal default and already used here |
+| Printable files must be in the **root** | **Medium/Low** | Not officially confirmed; common for this printer class — **verify physically** |
+
+> Note: the official AnkerMake support articles (Salesforce-hosted) could not be
+> fetched programmatically in this environment, so the two **Medium/Low** items
+> above should be confirmed on the actual printer during Phase 5.
 
 ---
 
@@ -227,12 +250,34 @@ and obvious** — a glue layer anyone can read top-to-bottom:
    `/usr/local/bin`, prompt for the **web username/password**, install
    **Avahi**, and enable **`ankermanager.service`** (instead of the old
    Python `usbshare.service`).
-4. **"Fix" the USB data cable** (tape the 5 V pin) so the Pi and printer don't
-   back-feed power — README §"Fixing the USB Data Cable". Power the Pi from its
-   **own** supply (PWR port); connect the **taped** cable from the Pi's
-   **USB/data** port to the printer.
+4. **Wire the Pi to the printer** — see **§6.1** (the M5's USB-C port changes the
+   cable vs. the original README).
 5. Reboot → visit **`http://ankermake.local/`**, log in, drag a `.gcode`/`.acode`
    in. Within ~10–15 s it appears on the printer's USB menu.
+
+### 6.1 Hardware / cabling for the AnkerMake M5 (USB-C)
+The M5 exposes a **USB-C host** port; the Pi Zero presents itself as a USB
+**device** via its **micro-USB OTG/data** port (the inner port, labelled "USB" on
+the Pi — *not* the "PWR" port). So the link is:
+
+```
+  AnkerMake M5  [USB-C host] ── cable ── [micro-USB B, "USB" port]  Pi Zero 2 W
+```
+
+- **Cable:** a **USB-C (male) → micro-USB-B (male)** cable (or a micro-USB→USB-A
+  OTG-style chain plus a USB-A(F)→USB-C(M) adapter). A normal USB-C↔micro-USB
+  cable sets the CC pins so the printer sees a device attached.
+- **Power / avoid back-feed:** keep powering the **Pi from its own supply** via the
+  **PWR** port. The printer's USB-C port will also try to supply 5 V (VBUS) to the
+  "stick", so to avoid two sources fighting, use a **data cable whose VBUS/5 V line
+  is not connected** (the USB-C equivalent of the README's "tape the 5 V pin"
+  trick). *Do not* assume the M5's USB-C port can cleanly power the Pi — treat
+  "power from the printer" as untested on USB-C.
+- **Gadget driver:** we default to **`g_mass_storage`** (set `FM_DRIVER`), which
+  presents a plain single-LUN USB stick — the most compatible choice and what the
+  repo recommends when a printer rejects the composite `g_multi` gadget. The USB-C
+  connector doesn't change this; the device still enumerates as standard mass
+  storage.
 
 ---
 
@@ -255,6 +300,10 @@ and obvious** — a glue layer anyone can read top-to-bottom:
   the Zero 2 W's 512 MB. (Run the service with a modest `MemoryMax` if desired.)
 - **Driver fallback:** if the M5 dislikes `g_multi`, set `FM_DRIVER=g_mass_storage`
   (the default here) — mirrors the repo's existing troubleshooting note.
+- **USB-C cabling/power (M5-specific):** see §6.1 — needs a USB-C↔micro-USB cable
+  and VBUS isolation; don't assume the printer's USB-C port can power the Pi.
+- **Unverified printer behaviour:** filesystem (FAT32 assumed) and root-only file
+  listing are **Medium/Low confidence** (§1.1) — confirm in Phase 5.
 - **Security:** Basic Auth + LAN-only. Never port-forward it.
 - **mDNS on Windows:** needs Bonjour (often already present); else use the IP.
 
@@ -273,9 +322,12 @@ and obvious** — a glue layer anyone can read top-to-bottom:
       linear, idempotent bash** per §5.6) — default the image to **50 GB sparse**,
       install Bun, `bun build --compile`, install `ankermanager.service` + Avahi,
       prompt for credentials; **remove** `usbshare.py` + `usbshare.service`.
-- [ ] **Phase 5 — On-Pi validation:** flash 64-bit OS, install, attach to the M5,
-      confirm a dropped file prints and that delete/mkdir reflect on the printer,
-      and that a Samba-saved file also triggers a replug.
+- [ ] **Phase 5 — On-Pi validation:** flash 64-bit OS, install, attach to the M5
+      via the USB-C cable (§6.1), confirm a dropped file prints and that
+      delete/mkdir reflect on the printer, and that a Samba-saved file also
+      triggers a replug. **Also verify the two unknowns from §1.1:** (a) does the
+      M5 read **FAT32** as-is, and (b) does it list files only in the **root** or
+      also in **sub-folders**?
 - [ ] **Phase 6 — Docs:** update `README.md` (64-bit OS note, web-app section,
       `http://<hostname>.local/` URL, remove Python steps).
 
@@ -293,3 +345,19 @@ RPi-Zero-W-WiFi-USB/
 ├── README.md                  # updated for Bun / 64-bit OS
 └── usbshare.py / .service     # REMOVED (folded into ankermanager.ts)
 ```
+
+---
+
+## 10. Sources (AnkerMake M5 USB research)
+
+- Tom's Hardware — *AnkerMake M5 Review*: https://www.tomshardware.com/reviews/ankermake-m5
+- All3DP — *AnkerMake M5 Review*: https://all3dp.com/1/ankermake-m5-review-3d-printer-specs/
+- TechRadar — *AnkerMake M5C Review*: https://www.techradar.com/pro/ankermake-m5c-review
+- 3DPrintBeginner — *AnkerMake M5C Review*: https://3dprintbeginner.com/ankermake-m5c-review/
+- AnkerMake Support — *How to Transfer Data and Start Printing (M5)*: https://support.ankermake.com/s/article/How-to-Transfer-Data-and-Start-Printing
+- AnkerMake Support — *Data Transmission and Printing of the M5C*: https://support.ankermake.com/s/article/Data-Transmission-and-Printing-of-the-M5C
+
+> The `support.ankermake.com` articles are Salesforce-hosted and could not be
+> fetched programmatically in this environment; the **High-confidence** USB-C /
+> ports / file-type facts come from the independent review sites above. Items
+> marked Medium/Low in §1.1 still need on-printer confirmation.
