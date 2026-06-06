@@ -311,25 +311,26 @@ the Pi — *not* the "PWR" port). So the link is:
 
 ## 8. Build checklist / phases
 
-- [ ] **Phase 1 — App core:** `ankermanager.ts` with `Bun.serve` + list/upload/
-      mkdir/delete and the inline UI; run locally with `FM_ROOT=/tmp/test bun run
-      ankermanager.ts` and test in a browser.
-- [ ] **Phase 2 — Replug + watcher:** debounced single-flight `replug()`; trigger
-      on app mutations **and** on external (Samba) changes via chokidar/polling.
-- [ ] **Phase 3 — UX:** drag-and-drop + progress, download route,
+- [x] **Phase 1 — App core:** `ankermanager.ts` with `Bun.serve` + list/upload/
+      mkdir/delete and the inline UI; runs locally with `FM_ROOT=/tmp/test bun run
+      ankermanager.ts` and tested in a browser.
+- [x] **Phase 2 — Replug + watcher:** debounced single-flight `replug()`; triggers
+      on app mutations **and** on external (Samba) changes via recursive `fs.watch`
+      with a polling backstop.
+- [x] **Phase 3 — UX:** drag-and-drop + progress, download route,
       free-space/status bar, mobile CSS, print-safety warning.
-- [ ] **Phase 4 — Service + install:** extend `install.sh` (kept **simple,
-      linear, idempotent bash** per §5.6) — default the image to **50 GB sparse**,
-      install Bun, `bun build --compile`, install `ankermanager.service` + Avahi,
-      prompt for credentials; **remove** `usbshare.py` + `usbshare.service`.
+- [x] **Phase 4 — Service + install:** `install.sh` rewritten (simple, linear,
+      idempotent bash per §5.6) — 50 GB sparse image, installs Bun, `bun build
+      --compile`, installs `ankermanager.service` + Avahi, prompts for credentials;
+      **removes** the old `usbshare.py` + `usbshare.service`.
 - [ ] **Phase 5 — On-Pi validation:** flash 64-bit OS, install, attach to the M5
       via the USB-C cable (§6.1), confirm a dropped file prints and that
       delete/mkdir reflect on the printer, and that a Samba-saved file also
       triggers a replug. **Also verify the two unknowns from §1.1:** (a) does the
       M5 read **FAT32** as-is, and (b) does it list files only in the **root** or
-      also in **sub-folders**?
-- [ ] **Phase 6 — Docs:** update `README.md` (64-bit OS note, web-app section,
-      `http://<hostname>.local/` URL, remove Python steps).
+      also in **sub-folders**?  *(Requires physical hardware.)*
+- [x] **Phase 6 — Docs:** `README.md` updated (64-bit OS note, web-app section,
+      `http://<hostname>.local/` URL, USB-C cabling, Python steps removed).
 
 ---
 
