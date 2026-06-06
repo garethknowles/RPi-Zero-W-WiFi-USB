@@ -401,7 +401,7 @@ const INDEX_HTML = /* html */ `<!doctype html>
     <thead><tr><th>Name</th><th class="size">Size</th><th>Modified</th><th></th></tr></thead>
     <tbody id="list"></tbody>
   </table>
-  <p class="muted">Tip: the AnkerMake M5 may only show files in the <b>root</b> of the drive — keep printable <code>.gcode</code>/<code>.acode</code> files there. Avoid changing files during an active print.</p>
+  <p class="muted">Tip: avoid changing files during an active print — the printer streams from the drive, and a replug mid-job could interrupt it.</p>
   <div id="status"></div>
 
 <script>

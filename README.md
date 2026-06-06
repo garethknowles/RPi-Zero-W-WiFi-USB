@@ -120,9 +120,9 @@ http://ankermake.local/      (or http://<pi-ip>/)
 Log in, then **drag & drop** a `.gcode`/`.acode` file. Within ~10–15 seconds it
 appears on the printer's USB menu.
 
-> **AnkerMake M5 note:** keep printable files in the **root** of the drive — the
-> M5 may not browse sub-folders. Use folders only for your own archiving, and
-> avoid changing files during an active print.
+> **AnkerMake M5 note:** sub-folders are browsable on the printer, so organise
+> as you like. Just avoid changing files during an active print — the printer
+> streams from the drive, and a replug mid-job could interrupt it.
 
 ---
 
