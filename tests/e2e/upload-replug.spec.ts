@@ -7,8 +7,9 @@
  * Tests run serially because they share the single webServer + mock log.
  */
 import { expect, test } from "@playwright/test";
-import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { E2E_MOCK_LOG, E2E_ROOT } from "../../playwright.e2e.config";
 
 test.describe.configure({ mode: "serial" });
@@ -112,6 +113,55 @@ test("dropping a folder uploads its contents and preserves structure", async ({ 
   await expect(page.locator("td", { hasText: "cube.gcode" })).toBeVisible();
   await page.locator(".name.dir", { hasText: "sub" }).click();
   await expect(page.locator("td", { hasText: "nested.gcode" })).toBeVisible();
+});
+
+test("one file failing is reported by name — the rest still upload", async ({ page }) => {
+  let dialogMsg = "";
+  page.on("dialog", (d) => {
+    dialogMsg = d.message();
+    d.accept();
+  });
+
+  // Abort only the first /api/upload request; let the rest through. Uploads are
+  // sequential, so this fails 'bad.gcode' but not 'good.gcode'.
+  let n = 0;
+  await page.route("**/api/upload**", (route) => {
+    n += 1;
+    if (n === 1) return route.abort();
+    return route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator("input#file").setInputFiles([
+    { name: "bad.gcode", mimeType: "text/plain", buffer: Buffer.from("x") },
+    { name: "good.gcode", mimeType: "text/plain", buffer: Buffer.from("y") },
+  ]);
+
+  // The second file uploaded despite the first failing...
+  await expect(page.locator("td", { hasText: "good.gcode" })).toBeVisible();
+  await expect(page.locator("td", { hasText: "bad.gcode" })).toHaveCount(0);
+  // ...and the failure was surfaced to the user, naming the file.
+  await expect.poll(() => dialogMsg).toContain("bad.gcode");
+});
+
+test("the Upload folder button uploads a folder and preserves structure", async ({ page }, testInfo) => {
+  // Lay down a real folder tree and feed it to the <input webkitdirectory>.
+  const dir = testInfo.outputPath("BoardGames");
+  await mkdir(join(dir, "dragons"), { recursive: true });
+  await writeFile(join(dir, "box.gcode"), "G1 X0\n");
+  await writeFile(join(dir, "dragons", "lair.gcode"), "G1 Y0\n");
+
+  await page.goto("/");
+  await page.locator("input#folder").setInputFiles(dir);
+
+  await expect(page.locator(".name.dir", { hasText: "BoardGames" })).toBeVisible();
+  await page.waitForTimeout(300);
+  expect(await modprobeCalls()).toEqual([]);
+
+  await page.locator(".name.dir", { hasText: "BoardGames" }).click();
+  await expect(page.locator("td", { hasText: "box.gcode" })).toBeVisible();
+  await page.locator(".name.dir", { hasText: "dragons" }).click();
+  await expect(page.locator("td", { hasText: "lair.gcode" })).toBeVisible();
 });
 
 test("deleting a file removes it without replugging", async ({ page }) => {
