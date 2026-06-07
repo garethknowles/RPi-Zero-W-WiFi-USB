@@ -22,27 +22,21 @@ it shows up on the printer.
 | `/piusb.bin` | A large (default **50 GB**, sparse) file, formatted **FAT32**, that *is* the "USB stick" |
 | `g_mass_storage` USB gadget | Presents `/piusb.bin` to the printer over the Pi's micro-USB **data** port |
 | `/mnt/usb_share` | The same image loop-mounted on the Pi so files can be read/written |
-| **`ankermanager`** | A single self-contained app (TypeScript, built with [Bun](https://bun.sh)) that serves the **web UI** *and* "replugs" the virtual USB on demand, so the printer re-reads the files |
+| **`ankermanager`** | A single self-contained app (TypeScript, built with [Bun](https://bun.sh)) that serves the **web UI** and loads the USB gadget at startup so the printer sees the drive |
 
 The web UI is the **only** way files reach the drive — there's no network share.
 That keeps a single writer on the FAT32 image and means nothing litters the drive
 with desktop metadata.
 
-### Why "Sync to printer" is a button, not automatic
+### Files just appear on the printer
 
-USB Mass Storage is a **block-level** protocol: the printer runs its own FAT32
-driver and caches the directory listing. There is no message in the protocol for
-the Pi to say "your cache is stale", so the printer keeps showing its old file
-list until the USB device is **re-enumerated** (unplugged and replugged) — just
-like physically moving a stick from your laptop to the printer. `ankermanager`
-does that re-enumeration in software when you press **Sync to printer**.
+The AnkerMake M5 re-reads its USB directory each time you open its file menu, so
+files you upload (or delete) show up on the printer on their own — no "sync" or
+replug step, and nothing ever disconnects the drive (which would abort a print).
+The app only loads the gadget **once at startup** to present the drive.
 
-It's a deliberate button rather than automatic because re-enumeration briefly
-disconnects the drive, and doing that **mid-print would abort the job** (the
-printer streams gcode straight off the drive). Only you know when it's safe, so
-uploads/deletes are saved immediately but marked *pending* until you sync. The
-pending flag is stored on the Pi, so it's correct even after a page reload or
-from another device.
+> If your printer ever *doesn't* pick up a change, power-cycle its USB or reboot
+> the printer to force a fresh read — but on the M5 this isn't normally needed.
 
 `ankermanager` replaces the older Python watchdog — it's one binary, one systemd
 service, no Python. See [`PLAN.md`](PLAN.md) for the full design and rationale.
@@ -137,13 +131,12 @@ After the installer reboots the Pi, open:
 http://ankermake.local/      (or http://<pi-ip>/)
 ```
 
-Log in, then **drag & drop** a `.gcode`/`.acode` file — it's saved instantly.
-When you're ready (and **not** mid-print), press **Sync to printer**; a few
-seconds later the file appears on the printer's USB menu.
+Log in, then **drag & drop** a `.gcode`/`.acode` file — or a whole folder — and
+it's saved instantly. It appears on the printer's USB menu the next time you open
+that menu.
 
 > **AnkerMake M5 note:** sub-folders are browsable on the printer, so organise
-> as you like. Never press **Sync to printer** during an active print — the
-> printer streams from the drive, and the replug would interrupt the job.
+> as you like.
 
 ---
 
@@ -153,9 +146,7 @@ seconds later the file appears on the printer's USB menu.
 - **Upload** by drag & drop or the Upload button (with a progress bar).
 - **New folder** and **Delete** (files or whole folders).
 - **Download** a file back to your computer.
-- **Sync to printer** pushes pending changes to the printer (replug). A status
-  bar shows free space, file count, and whether changes are still pending or the
-  printer is up to date.
+- A status bar shows free space and file count.
 
 It's protected by HTTP Basic Auth (set during install). **Keep it on your LAN —
 do not port-forward it to the internet.**
@@ -171,7 +162,6 @@ Settings live in `/etc/ankermanager.env` (read by the systemd service):
 | `FM_DRIVER` | `g_mass_storage` | USB gadget driver (`g_mass_storage` or `g_multi`) |
 | `FM_USB_IMAGE` | `/piusb.bin` | The FAT32 image file |
 | `FM_USER` / `FM_PASS` | — | Web login (empty `FM_USER` disables auth) |
-| `FM_STATE_FILE` | `/var/lib/ankermanager/sync.json` | Where the pending-sync flag is persisted |
 
 After editing it: `sudo systemctl restart ankermanager`.
 

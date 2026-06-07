@@ -1,5 +1,5 @@
 [Unit]
-Description=AnkerMake WiFi File Manager (web UI + USB replug)
+Description=AnkerMake WiFi File Manager (web UI + USB gadget)
 # Wait for the network and for the FAT32 image to be loop-mounted before starting.
 After=network-online.target mnt-usb_share.mount
 Wants=network-online.target
@@ -9,11 +9,8 @@ Requires=mnt-usb_share.mount
 Type=simple
 # Config + web credentials live here (written by install.sh).
 EnvironmentFile=/etc/ankermanager.env
-# Runs as root: needs modprobe to load/unload the USB gadget and to bind port 80.
+# Runs as root: needs modprobe to load the USB gadget and to bind port 80.
 ExecStart=/usr/local/bin/ankermanager
-# Creates /var/lib/ankermanager and exports it as $STATE_DIRECTORY. The app
-# persists the "changes await a sync" flag there so it survives restarts.
-StateDirectory=ankermanager
 Restart=on-failure
 RestartSec=3
 

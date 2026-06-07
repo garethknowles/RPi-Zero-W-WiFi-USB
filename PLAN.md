@@ -1,15 +1,16 @@
 # PLAN — AnkerMake M5 WiFi File Manager on a Pi Zero 2 W (TypeScript / Bun)
 
-> **⚠️ Superseded in two places — this doc is the original design.** Two
-> decisions below have since changed; the README and code are authoritative:
-> 1. **No Samba.** The web UI is the only writer to the drive. References to a
->    Samba `[usb]` share and the **fs watcher / debounced auto-replug** that
->    existed to catch external (Samba) writes no longer apply — there's nothing
->    external to watch, so there's no watcher.
-> 2. **Replug is manual, not automatic.** Re-enumerating the USB mid-print would
->    abort the job, so mutations are saved immediately and marked *pending*
->    (persisted on disk); the replug only happens when the user presses
->    **Sync to printer**. The `POST /api/sync` endpoint does it.
+> **⚠️ Superseded — this doc is the original design; the README and code are
+> authoritative.** What actually shipped differs:
+> 1. **No Samba.** The web UI is the only writer to the drive, so the **fs
+>    watcher / debounced auto-replug** that existed to catch external (Samba)
+>    writes is gone — there's nothing external to watch.
+> 2. **No replug at all.** The AnkerMake M5 re-reads its own USB directory when
+>    you open its file menu, so changes appear on their own. The app just loads
+>    the gadget **once at startup**; there is no "sync" step or `/api/sync`
+>    endpoint, and nothing ever disconnects the drive mid-print.
+> 3. **Folder uploads.** Drag-and-drop accepts whole folders (the upload API
+>    takes a per-file relative `paths` field and recreates the structure).
 
 A plan to add a **browser-based file manager** (view / delete / create folders /
 drag-and-drop upload) on top of this repo's existing "Pi-as-USB-stick" setup, so

@@ -1,15 +1,15 @@
 /**
- * End-to-end: a user drives the SPA in a browser. File changes are saved
- * immediately but must NOT replug the USB on their own — the replug only fires
- * when the user presses "Sync to printer". We assert both halves via the mock
- * modprobe bin on PATH.
+ * End-to-end: a user drives the SPA in a browser. Uploads (including dropped
+ * folders) save immediately, the printer picks them up on its own, and nothing
+ * ever replugs the USB gadget — we assert the mock modprobe bin on PATH is only
+ * touched by the one-time startup load.
  *
  * Tests run serially because they share the single webServer + mock log.
  */
 import { expect, test } from "@playwright/test";
 import { readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { E2E_MOCK_LOG, E2E_ROOT, E2E_USB_IMAGE } from "../../playwright.e2e.config";
+import { E2E_MOCK_LOG, E2E_ROOT } from "../../playwright.e2e.config";
 
 test.describe.configure({ mode: "serial" });
 
@@ -19,35 +19,25 @@ async function modprobeCalls(): Promise<string[]> {
   return txt.split("\n").filter((l) => l.length > 0);
 }
 
-async function clearModprobeLog(): Promise<void> {
-  await writeFile(E2E_MOCK_LOG, "");
-}
-
-async function waitForNewCall(before: number, timeoutMs = 3_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if ((await modprobeCalls()).length > before) return;
+// The gadget is loaded once at server startup (async, may land just after the
+// server starts answering). Wait for it before any test so the per-test log
+// clear can't race with it — after this, nothing ever calls modprobe again.
+test.beforeAll(async () => {
+  const deadline = Date.now() + 5_000;
+  while ((await modprobeCalls()).length === 0 && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 50));
   }
-  throw new Error(`No new modprobe call within ${timeoutMs}ms`);
-}
-
-// Click "Sync to printer" and accept the confirmation dialog.
-async function pressSync(page: import("@playwright/test").Page): Promise<void> {
-  page.once("dialog", (d) => d.accept());
-  await page.getByRole("button", { name: /Sync to printer/i }).click();
-}
+});
 
 test.beforeEach(async () => {
   for (const entry of await readdir(E2E_ROOT)) {
     await rm(`${E2E_ROOT}/${entry}`, { recursive: true, force: true });
   }
-  await clearModprobeLog();
+  await writeFile(E2E_MOCK_LOG, ""); // startup load already settled (beforeAll)
 });
 
-test("uploading a file saves it and marks it pending — but does NOT replug", async ({ page }) => {
+test("uploading a file shows it immediately and never replugs the gadget", async ({ page }) => {
   await page.goto("/");
-
   await page.locator('input[type="file"]').setInputFiles({
     name: "first.gcode",
     mimeType: "text/plain",
@@ -55,54 +45,85 @@ test("uploading a file saves it and marks it pending — but does NOT replug", a
   });
   await expect(page.locator("td", { hasText: "first.gcode" })).toBeVisible();
 
-  // Status bar shows the change is not yet on the printer.
-  await expect(page.locator("#status")).toContainText(/not yet on the printer/i);
   // Give any (incorrect) replug a chance to fire, then assert none did.
   await page.waitForTimeout(500);
   expect(await modprobeCalls()).toEqual([]);
 });
 
-test("pressing Sync to printer triggers a modprobe replug cycle and clears pending", async ({ page }) => {
+test("uploading multiple files at once lists them all", async ({ page }) => {
   await page.goto("/");
-  await page.locator('input[type="file"]').setInputFiles({
-    name: "ready.gcode",
-    mimeType: "text/plain",
-    buffer: Buffer.from("G1 X0\n"),
-  });
-  await expect(page.locator("td", { hasText: "ready.gcode" })).toBeVisible();
-  await clearModprobeLog();
-
-  const before = (await modprobeCalls()).length;
-  await pressSync(page);
-
-  await waitForNewCall(before);
-  await page.waitForTimeout(250); // let both unload + load lines land
-  const calls = await modprobeCalls();
-  expect(calls).toContain("-r g_mass_storage");
-  const load = calls.find((l) => l.startsWith("g_mass_storage "));
-  expect(load).toBeDefined();
-  expect(load).toContain(`file=${E2E_USB_IMAGE}`);
-  expect(load).toContain("stall=0");
-  expect(load).toContain("removable=1");
-
-  // And the UI now reports the printer is up to date.
-  await expect(page.locator("#status")).toContainText(/up to date/i);
+  await page.locator('input[type="file"]').setInputFiles([
+    { name: "a.gcode", mimeType: "text/plain", buffer: Buffer.from("a") },
+    { name: "b.gcode", mimeType: "text/plain", buffer: Buffer.from("bb") },
+  ]);
+  await expect(page.locator("td", { hasText: "a.gcode" })).toBeVisible();
+  await expect(page.locator("td", { hasText: "b.gcode" })).toBeVisible();
 });
 
-test("deleting and creating folders also stay pending until a sync", async ({ page }) => {
+test("dropping a folder uploads its contents and preserves structure", async ({ page }) => {
   await page.goto("/");
 
-  // Create a folder — pending, no replug.
-  page.once("dialog", (d) => d.accept("models"));
-  await page.getByRole("button", { name: /New folder/i }).click();
-  await expect(page.locator("td", { hasText: "models" })).toBeVisible();
-  await page.waitForTimeout(400);
-  expect(await modprobeCalls()).toEqual([]);
-  await expect(page.locator("#status")).toContainText(/not yet on the printer/i);
+  // Build a webkitGetAsEntry-style directory tree and feed it through the page's
+  // own folder-walk + upload code (the real logic the drop handler invokes — a
+  // synthetic DragEvent's dataTransfer isn't honoured by Chromium).
+  await page.evaluate(async () => {
+    const fileEntry = (name: string, content: string) => ({
+      isFile: true,
+      isDirectory: false,
+      name,
+      file: (cb: (f: File) => void) => cb(new File([content], name, { type: "text/plain" })),
+    });
+    const dirEntry = (name: string, children: any[]) => ({
+      isFile: false,
+      isDirectory: true,
+      name,
+      createReader: () => {
+        let done = false;
+        return {
+          // Flip `done` before invoking cb: walkEntries recurses synchronously
+          // here (a real DirectoryReader is async), so the flag must be set first.
+          readEntries: (cb: (e: any[]) => void) => {
+            const batch = done ? [] : children;
+            done = true;
+            cb(batch);
+          },
+        };
+      },
+    });
+    const root = dirEntry("models", [
+      fileEntry("cube.gcode", "G1 X0\n"),
+      dirEntry("sub", [fileEntry("nested.gcode", "G1 Y0\n")]),
+    ]);
+    // walkEntries + uploadItems are globals from the inline page script.
+    // @ts-expect-error page globals
+    uploadItems(await walkEntries([root]));
+  });
 
-  // One sync pushes everything.
-  await pressSync(page);
-  await waitForNewCall(0);
-  await page.waitForTimeout(250);
-  expect((await modprobeCalls()).some((l) => l.startsWith("g_mass_storage "))).toBe(true);
+  // The dropped folder appears at the top level...
+  await expect(page.locator(".name.dir", { hasText: "models" })).toBeVisible();
+  // ...and never triggered a replug.
+  await page.waitForTimeout(300);
+  expect(await modprobeCalls()).toEqual([]);
+
+  // Drill in to confirm the nested structure was preserved.
+  await page.locator(".name.dir", { hasText: "models" }).click();
+  await expect(page.locator("td", { hasText: "cube.gcode" })).toBeVisible();
+  await expect(page.locator(".name.dir", { hasText: "sub" })).toBeVisible();
+});
+
+test("deleting a file removes it without replugging", async ({ page }) => {
+  await page.goto("/");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "doomed.gcode",
+    mimeType: "text/plain",
+    buffer: Buffer.from("x"),
+  });
+  await expect(page.locator("td", { hasText: "doomed.gcode" })).toBeVisible();
+
+  page.once("dialog", (d) => d.accept());
+  await page.locator(".del").first().click();
+  await expect(page.locator("td", { hasText: "doomed.gcode" })).toHaveCount(0);
+
+  await page.waitForTimeout(300);
+  expect(await modprobeCalls()).toEqual([]);
 });

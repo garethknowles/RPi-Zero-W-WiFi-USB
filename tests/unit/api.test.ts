@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { basicAuth, startServer, type TestServer } from "../helpers/server";
 
@@ -98,6 +97,37 @@ describe("POST /api/upload", () => {
     form.append("files", new Blob(["bb"]), "b.gcode");
     const r = await fetch(server.url + "/api/upload", { method: "POST", body: form });
     expect(((await r.json()) as { saved: string[] }).saved).toEqual(["a.gcode", "b.gcode"]);
+  });
+
+  test("preserves folder structure from a 'paths' field (dropped folder)", async () => {
+    server = await startServer();
+    const form = new FormData();
+    form.append("files", new Blob(["a"]), "a.gcode");
+    form.append("paths", "models/a.gcode");
+    form.append("files", new Blob(["b"]), "b.gcode");
+    form.append("paths", "models/sub/b.gcode");
+    const r = await fetch(server.url + "/api/upload", { method: "POST", body: form });
+    expect(r.status).toBe(200);
+    expect(((await r.json()) as { saved: string[] }).saved).toEqual([
+      "models/a.gcode",
+      "models/sub/b.gcode",
+    ]);
+    // The nested file is reachable at its created path.
+    const dl = await fetch(server.url + "/api/download?path=" + encodeURIComponent("models/sub/b.gcode"));
+    expect(dl.status).toBe(200);
+    expect(await dl.text()).toBe("b");
+    // Top level shows just the folder.
+    const top = (await (await fetch(server.url + "/api/list")).json()) as { items: { name: string; dir: boolean }[] };
+    expect(top.items.map((i) => ({ name: i.name, dir: i.dir }))).toEqual([{ name: "models", dir: true }]);
+  });
+
+  test("rejects path traversal in a 'paths' entry", async () => {
+    server = await startServer();
+    const form = new FormData();
+    form.append("files", new Blob(["x"]), "evil.gcode");
+    form.append("paths", "../evil.gcode");
+    const r = await fetch(server.url + "/api/upload", { method: "POST", body: form });
+    expect(r.status).toBe(400);
   });
 
   test("strips path components from the uploaded filename", async () => {
@@ -237,21 +267,10 @@ describe("startup gadget load", () => {
   });
 });
 
-describe("pending-sync state", () => {
-  async function getStatus(base: string) {
-    return (await (await fetch(base + "/api/status")).json()) as {
-      pending: boolean;
-      changes: number;
-      syncing: boolean;
-    };
-  }
-
-  test("a fresh drive reports no pending changes", async () => {
-    server = await startServer();
-    expect((await getStatus(server.url)).pending).toBe(false);
-  });
-
-  test("uploads/mkdir/delete mark pending WITHOUT replugging", async () => {
+describe("no replug on file changes", () => {
+  // The printer re-reads its own directory, so uploads/mkdir/delete must NOT
+  // touch the gadget — only the one-time startup load is allowed.
+  test("uploads, mkdir and delete never call modprobe", async () => {
     server = await startServer();
     await server.awaitModprobeCall(2000); // drain the startup load
     await new Promise((r) => setTimeout(r, 200));
@@ -259,54 +278,10 @@ describe("pending-sync state", () => {
 
     await uploadFile(server.url, "", "a.gcode", "x");
     await fetch(server.url + "/api/mkdir", postJson({ path: "", name: "d" }));
+    await fetch(server.url + "/api/delete", postJson({ path: "a.gcode" }));
     await new Promise((r) => setTimeout(r, 300));
 
-    const s = await getStatus(server.url);
-    expect(s.pending).toBe(true);
-    expect(s.changes).toBe(2);
-    // No new modprobe calls — nothing was pushed to the printer yet.
     expect((await server.readModprobeCalls()).length).toBe(before);
-  });
-
-  test("POST /api/sync replugs (unload + load) and clears pending", async () => {
-    server = await startServer();
-    await server.awaitModprobeCall(2000); // drain startup load
-    await new Promise((r) => setTimeout(r, 200));
-    await uploadFile(server.url, "", "a.gcode", "x");
-    await new Promise((r) => setTimeout(r, 200));
-    await server.clearModprobeCalls();
-
-    const r = await fetch(server.url + "/api/sync", { method: "POST" });
-    expect(r.status).toBe(200);
-    const s = (await r.json()) as { pending: boolean; changes: number };
-    expect(s.pending).toBe(false);
-    expect(s.changes).toBe(0);
-
-    const calls = await server.readModprobeCalls();
-    expect(calls).toContain("-r g_mass_storage");
-    expect(calls.some((l) => l.startsWith("g_mass_storage "))).toBe(true);
-  });
-
-  test("the pending flag survives a restart (persisted on disk)", async () => {
-    server = await startServer();
-    await uploadFile(server.url, "", "a.gcode", "x");
-    await new Promise((r) => setTimeout(r, 200));
-    // Restart the app against the same root + state file; gadget is "already
-    // loaded" from the first run's view... but off-Pi /sys/module is absent, so
-    // it reloads and clears. Instead assert the state FILE itself holds pending.
-    const raw = await readFile(server.stateFile, "utf8");
-    expect(JSON.parse(raw).pending).toBe(true);
-  });
-
-  test("dev mode (no driver) still clears pending on sync", async () => {
-    server = await startServer({ driver: "" });
-    await uploadFile(server.url, "", "a.gcode", "x");
-    await new Promise((r) => setTimeout(r, 200));
-    expect((await getStatus(server.url)).pending).toBe(true);
-
-    await fetch(server.url + "/api/sync", { method: "POST" });
-    expect((await getStatus(server.url)).pending).toBe(false);
-    expect(await server.readModprobeCalls()).toEqual([]);
   });
 });
 
@@ -326,13 +301,6 @@ describe("system junk files", () => {
 
     const s = (await (await fetch(server.url + "/api/status")).json()) as { files: number };
     expect(s.files).toBe(1);
-  });
-
-  test("are deleted from the drive on sync", async () => {
-    server = await startServer();
-    await writeFile(join(server.root, ".DS_Store"), "junk");
-    await fetch(server.url + "/api/sync", { method: "POST" });
-    expect(existsSync(join(server.root, ".DS_Store"))).toBe(false);
   });
 });
 

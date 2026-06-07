@@ -4,18 +4,11 @@
  * webServer is started.
  */
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
-import {
-  E2E_MOCK_BIN,
-  E2E_MOCK_LOG,
-  E2E_ROOT,
-  E2E_STATE_FILE,
-} from "../../playwright.e2e.config";
+import { E2E_MOCK_BIN, E2E_MOCK_LOG, E2E_ROOT } from "../../playwright.e2e.config";
 
 export default async function globalSetup(): Promise<void> {
   await rm(E2E_ROOT, { recursive: true, force: true });
   await mkdir(E2E_ROOT, { recursive: true });
-  // Start each run with no persisted pending-sync state.
-  await rm(E2E_STATE_FILE, { force: true });
 
   await rm(E2E_MOCK_BIN, { recursive: true, force: true });
   await mkdir(E2E_MOCK_BIN, { recursive: true });

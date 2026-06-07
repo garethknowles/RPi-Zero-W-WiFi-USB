@@ -16,8 +16,6 @@ export interface TestServer {
   url: string;
   root: string;
   mockLog: string;
-  /** Path to the persisted pending-sync state file for this server. */
-  stateFile: string;
   stop: () => Promise<void>;
   /** Snapshot current modprobe invocations (one per line, in order). */
   readModprobeCalls: () => Promise<string[]>;
@@ -53,9 +51,6 @@ export async function startServer(opts: StartOptions = {}): Promise<TestServer> 
   const root = await mkdtemp(join(tmpdir(), "ankermgr-root-"));
   const mockDir = await mkdtemp(join(tmpdir(), "ankermgr-mock-"));
   const mockLog = join(mockDir, "modprobe.log");
-  // Persist the pending-sync flag inside the per-server mock dir so tests stay
-  // isolated and the app never needs /var/lib (which it can't create off-Pi).
-  const stateFile = join(mockDir, "sync-state.json");
   await makeMockBin(mockDir, mockLog);
 
   const port = nextPort++;
@@ -72,7 +67,6 @@ export async function startServer(opts: StartOptions = {}): Promise<TestServer> 
       FM_HOST: "127.0.0.1",
       FM_DRIVER: opts.driver ?? "g_mass_storage",
       FM_USB_IMAGE: opts.usbImage ?? "/tmp/test-piusb.bin",
-      FM_STATE_FILE: stateFile,
       FM_USER: opts.user ?? "",
       FM_PASS: opts.pass ?? "",
       ...opts.extraEnv,
@@ -93,7 +87,6 @@ export async function startServer(opts: StartOptions = {}): Promise<TestServer> 
     url,
     root,
     mockLog,
-    stateFile,
     stop: async () => {
       proc.kill();
       await proc.exited;
