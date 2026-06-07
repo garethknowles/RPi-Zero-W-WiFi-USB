@@ -419,8 +419,10 @@ const INDEX_HTML = /* html */ `<!doctype html>
     <div class="crumbs" id="crumbs"></div>
     <span style="flex:1"></span>
     <button id="mkdirBtn">📁 New folder</button>
+    <button id="folderBtn">📂 Upload folder</button>
     <button class="primary" id="pickBtn">⬆️ Upload</button>
     <input type="file" id="file" multiple hidden>
+    <input type="file" id="folder" webkitdirectory multiple hidden>
   </div>
   <div id="drop">Drag &amp; drop files <b>or whole folders</b> here to upload</div>
   <progress id="prog" value="0" max="100" hidden></progress>
@@ -494,10 +496,14 @@ $("mkdirBtn").onclick = async () => {
 
 $("pickBtn").onclick = () => $("file").click();
 $("file").onchange = () => { uploadItems(toItems($("file").files)); $("file").value = ""; };
+$("folderBtn").onclick = () => $("folder").click();
+$("folder").onchange = () => { uploadItems(folderItems($("folder").files)); $("folder").value = ""; };
 
 // An "item" is { file, path } where path is relative to the current folder
-// (just the filename for flat picks, or "sub/dir/file" for dropped folders).
+// (just the filename for flat picks, "sub/dir/file" for folders).
 const toItems = (fileList) => Array.from(fileList).map(f => ({ file: f, path: f.name }));
+// <input webkitdirectory> exposes the relative path on each File.
+const folderItems = (fileList) => Array.from(fileList).map(f => ({ file: f, path: f.webkitRelativePath || f.name }));
 
 // Walk dropped entries (files and directories), preserving relative paths.
 async function walkEntries(entries) {
@@ -519,18 +525,31 @@ async function walkEntries(entries) {
   return out;
 }
 
-function uploadItems(items) {
+// Upload one file per request, sequentially. The Pi never has to buffer a whole
+// folder in memory, and a single file that can't be read/sent is reported by
+// name instead of aborting the entire batch. Each request carries the file's
+// relative path so folders are rebuilt server-side.
+async function uploadItems(items) {
   if (!items.length) return;
-  const fd = new FormData();
-  for (const it of items) { fd.append("files", it.file); fd.append("paths", it.path); }
-  const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/api/upload?path=" + encodeURIComponent(cwd));
-  $("prog").hidden = false; $("prog").value = 0;
-  xhr.upload.onprogress = (e) => { if (e.lengthComputable) $("prog").value = (e.loaded / e.total) * 100; };
-  xhr.onload = () => { $("prog").hidden = true; if (xhr.status >= 200 && xhr.status < 300) refresh();
-    else { let m="upload failed"; try{ m=JSON.parse(xhr.responseText).error||m; }catch{} alert(m); } };
-  xhr.onerror = () => { $("prog").hidden = true; alert("upload failed"); };
-  xhr.send(fd);
+  const prog = $("prog");
+  prog.hidden = false; prog.max = items.length; prog.value = 0;
+  const failed = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    try {
+      const fd = new FormData();
+      fd.append("files", it.file);
+      fd.append("paths", it.path);
+      const r = await fetch("/api/upload?path=" + encodeURIComponent(cwd), { method: "POST", body: fd });
+      if (!r.ok) { let m = "HTTP " + r.status; try { m = (await r.json()).error || m; } catch {} throw new Error(m); }
+    } catch (err) {
+      failed.push(it.path + " — " + (err && err.message ? err.message : err));
+    }
+    prog.value = i + 1;
+  }
+  prog.hidden = true;
+  await refresh();
+  if (failed.length) alert(failed.length + " file(s) failed to upload:\\n\\n" + failed.join("\\n"));
 }
 
 const drop = $("drop");
@@ -538,13 +557,18 @@ const drop = $("drop");
 ["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("hover"); }));
 drop.addEventListener("drop", async e => {
   const dt = e.dataTransfer;
-  // Snapshot directory entries synchronously — they're only valid during the event.
-  const entries = [];
-  if (dt.items && dt.items.length && dt.items[0].webkitGetAsEntry) {
-    for (const item of dt.items) { const en = item.webkitGetAsEntry(); if (en) entries.push(en); }
+  try {
+    // Snapshot directory entries synchronously — they're only valid during the event.
+    const entries = [];
+    if (dt && dt.items && dt.items.length && dt.items[0].webkitGetAsEntry) {
+      for (const item of dt.items) { const en = item.webkitGetAsEntry(); if (en) entries.push(en); }
+    }
+    const items = entries.length ? await walkEntries(entries) : toItems((dt && dt.files) || []);
+    await uploadItems(items);
+  } catch (err) {
+    $("prog").hidden = true;
+    alert("Upload failed: " + (err && err.message ? err.message : err));
   }
-  if (entries.length) uploadItems(await walkEntries(entries));
-  else if (dt.files && dt.files.length) uploadItems(toItems(dt.files)); // fallback: files only
 });
 
 refresh();

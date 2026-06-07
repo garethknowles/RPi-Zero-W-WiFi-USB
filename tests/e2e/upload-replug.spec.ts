@@ -38,7 +38,7 @@ test.beforeEach(async () => {
 
 test("uploading a file shows it immediately and never replugs the gadget", async ({ page }) => {
   await page.goto("/");
-  await page.locator('input[type="file"]').setInputFiles({
+  await page.locator('input#file').setInputFiles({
     name: "first.gcode",
     mimeType: "text/plain",
     buffer: Buffer.from("G1 X0\n"),
@@ -52,7 +52,7 @@ test("uploading a file shows it immediately and never replugs the gadget", async
 
 test("uploading multiple files at once lists them all", async ({ page }) => {
   await page.goto("/");
-  await page.locator('input[type="file"]').setInputFiles([
+  await page.locator('input#file').setInputFiles([
     { name: "a.gcode", mimeType: "text/plain", buffer: Buffer.from("a") },
     { name: "b.gcode", mimeType: "text/plain", buffer: Buffer.from("bb") },
   ]);
@@ -63,10 +63,11 @@ test("uploading multiple files at once lists them all", async ({ page }) => {
 test("dropping a folder uploads its contents and preserves structure", async ({ page }) => {
   await page.goto("/");
 
-  // Build a webkitGetAsEntry-style directory tree and feed it through the page's
-  // own folder-walk + upload code (the real logic the drop handler invokes — a
-  // synthetic DragEvent's dataTransfer isn't honoured by Chromium).
-  await page.evaluate(async () => {
+  // Drive the REAL drop handler: dispatch a 'drop' event whose dataTransfer
+  // exposes a webkitGetAsEntry() directory tree. (A synthetic DragEvent won't
+  // carry a dataTransfer, so we attach our own to a plain Event — this still
+  // exercises the page's actual drop listener, walk, and sequential upload.)
+  await page.evaluate(() => {
     const fileEntry = (name: string, content: string) => ({
       isFile: true,
       isDirectory: false,
@@ -79,9 +80,9 @@ test("dropping a folder uploads its contents and preserves structure", async ({ 
       name,
       createReader: () => {
         let done = false;
+        // Flip `done` before invoking cb: walkEntries recurses synchronously
+        // here (a real DirectoryReader is async), so the flag must be set first.
         return {
-          // Flip `done` before invoking cb: walkEntries recurses synchronously
-          // here (a real DirectoryReader is async), so the flag must be set first.
           readEntries: (cb: (e: any[]) => void) => {
             const batch = done ? [] : children;
             done = true;
@@ -94,9 +95,10 @@ test("dropping a folder uploads its contents and preserves structure", async ({ 
       fileEntry("cube.gcode", "G1 X0\n"),
       dirEntry("sub", [fileEntry("nested.gcode", "G1 Y0\n")]),
     ]);
-    // walkEntries + uploadItems are globals from the inline page script.
-    // @ts-expect-error page globals
-    uploadItems(await walkEntries([root]));
+    const dt = { items: [{ kind: "file", webkitGetAsEntry: () => root }], files: [] };
+    const ev = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "dataTransfer", { value: dt });
+    document.getElementById("drop")!.dispatchEvent(ev);
   });
 
   // The dropped folder appears at the top level...
@@ -105,15 +107,16 @@ test("dropping a folder uploads its contents and preserves structure", async ({ 
   await page.waitForTimeout(300);
   expect(await modprobeCalls()).toEqual([]);
 
-  // Drill in to confirm the nested structure was preserved.
+  // Drill all the way in to confirm the nested structure was preserved.
   await page.locator(".name.dir", { hasText: "models" }).click();
   await expect(page.locator("td", { hasText: "cube.gcode" })).toBeVisible();
-  await expect(page.locator(".name.dir", { hasText: "sub" })).toBeVisible();
+  await page.locator(".name.dir", { hasText: "sub" }).click();
+  await expect(page.locator("td", { hasText: "nested.gcode" })).toBeVisible();
 });
 
 test("deleting a file removes it without replugging", async ({ page }) => {
   await page.goto("/");
-  await page.locator('input[type="file"]').setInputFiles({
+  await page.locator('input#file').setInputFiles({
     name: "doomed.gcode",
     mimeType: "text/plain",
     buffer: Buffer.from("x"),

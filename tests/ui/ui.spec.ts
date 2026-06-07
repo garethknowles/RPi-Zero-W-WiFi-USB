@@ -24,7 +24,7 @@ test("creates a new folder via the New folder button", async ({ page }) => {
 
 test("uploads a file via the hidden file picker and shows it in the list", async ({ page }) => {
   await page.goto("/");
-  await page.locator('input[type="file"]').setInputFiles({
+  await page.locator('input#file').setInputFiles({
     name: "cube.gcode",
     mimeType: "text/plain",
     buffer: Buffer.from("G1 X0 Y0\n"),
@@ -43,7 +43,7 @@ test("navigates into a sub-folder via the breadcrumb", async ({ page }) => {
 
 test("deletes a file after confirm", async ({ page }) => {
   await page.goto("/");
-  await page.locator('input[type="file"]').setInputFiles({
+  await page.locator('input#file').setInputFiles({
     name: "doomed.gcode",
     mimeType: "text/plain",
     buffer: Buffer.from("x"),
