@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { basicAuth, startServer, type TestServer } from "../helpers/server";
 
 let server: TestServer | null = null;
@@ -201,14 +204,14 @@ describe("authentication", () => {
   });
 });
 
-describe("USB gadget replug (mocked)", () => {
-  test("calls modprobe -r then load on startup with FM_USB_IMAGE and FM_DRIVER", async () => {
+describe("startup gadget load", () => {
+  test("presents the drive on startup (load only, no unload) with image + flags", async () => {
     server = await startServer({ driver: "g_mass_storage", usbImage: "/tmp/fake-piusb.bin" });
     await server.awaitModprobeCall(2000);
-    // Let both the unload and load land.
     await new Promise((r) => setTimeout(r, 200));
     const calls = await server.readModprobeCalls();
-    expect(calls).toContain("-r g_mass_storage");
+    // The gadget isn't loaded off-Pi, so startup adds it — and must NOT replug.
+    expect(calls.some((l) => l.startsWith("-r "))).toBe(false);
     const load = calls.find((l) => l.startsWith("g_mass_storage "));
     expect(load).toBeDefined();
     expect(load).toContain("file=/tmp/fake-piusb.bin");
@@ -216,39 +219,12 @@ describe("USB gadget replug (mocked)", () => {
     expect(load).toContain("removable=1");
   });
 
-  test("replugs when a file is uploaded", async () => {
-    server = await startServer({ debounceMs: 50 });
-    await server.awaitModprobeCall(2000); // drain the startup replug
-    await new Promise((r) => setTimeout(r, 200));
-    await server.clearModprobeCalls();
-
-    await uploadFile(server.url, "", "trigger.gcode", "x");
-    await server.awaitModprobeCall(2000);
-    await new Promise((r) => setTimeout(r, 200)); // let the load line land too
-    const calls = await server.readModprobeCalls();
-    expect(calls.some((l) => l.startsWith("g_mass_storage "))).toBe(true);
-  });
-
-  test("replugs after delete", async () => {
-    server = await startServer({ debounceMs: 50 });
-    await uploadFile(server.url, "", "x.gcode", "x");
-    await server.awaitModprobeCall(2000);
-    await new Promise((r) => setTimeout(r, 200));
-    await server.clearModprobeCalls();
-
-    await fetch(server.url + "/api/delete", postJson({ path: "x.gcode" }));
-    await server.awaitModprobeCall(2000);
-    await new Promise((r) => setTimeout(r, 200));
-    const calls = await server.readModprobeCalls();
-    expect(calls.some((l) => l.startsWith("g_mass_storage "))).toBe(true);
-  });
-
   test("uses the configured driver name (g_multi)", async () => {
     server = await startServer({ driver: "g_multi" });
     await server.awaitModprobeCall(2000);
     await new Promise((r) => setTimeout(r, 200));
     const calls = await server.readModprobeCalls();
-    expect(calls.some((l) => l.startsWith("g_multi") || l === "-r g_multi")).toBe(true);
+    expect(calls.some((l) => l.startsWith("g_multi "))).toBe(true);
     expect(calls.every((l) => !l.includes("g_mass_storage"))).toBe(true);
   });
 
@@ -259,27 +235,104 @@ describe("USB gadget replug (mocked)", () => {
     await new Promise((r) => setTimeout(r, 400));
     expect(await server.readModprobeCalls()).toEqual([]);
   });
+});
 
-  test("coalesces a burst of uploads into a single replug cycle", async () => {
-    server = await startServer({ debounceMs: 200 });
-    await server.awaitModprobeCall(2000); // drain startup
-    await new Promise((r) => setTimeout(r, 400));
+describe("pending-sync state", () => {
+  async function getStatus(base: string) {
+    return (await (await fetch(base + "/api/status")).json()) as {
+      pending: boolean;
+      changes: number;
+      syncing: boolean;
+    };
+  }
+
+  test("a fresh drive reports no pending changes", async () => {
+    server = await startServer();
+    expect((await getStatus(server.url)).pending).toBe(false);
+  });
+
+  test("uploads/mkdir/delete mark pending WITHOUT replugging", async () => {
+    server = await startServer();
+    await server.awaitModprobeCall(2000); // drain the startup load
+    await new Promise((r) => setTimeout(r, 200));
+    const before = (await server.readModprobeCalls()).length;
+
+    await uploadFile(server.url, "", "a.gcode", "x");
+    await fetch(server.url + "/api/mkdir", postJson({ path: "", name: "d" }));
+    await new Promise((r) => setTimeout(r, 300));
+
+    const s = await getStatus(server.url);
+    expect(s.pending).toBe(true);
+    expect(s.changes).toBe(2);
+    // No new modprobe calls — nothing was pushed to the printer yet.
+    expect((await server.readModprobeCalls()).length).toBe(before);
+  });
+
+  test("POST /api/sync replugs (unload + load) and clears pending", async () => {
+    server = await startServer();
+    await server.awaitModprobeCall(2000); // drain startup load
+    await new Promise((r) => setTimeout(r, 200));
+    await uploadFile(server.url, "", "a.gcode", "x");
+    await new Promise((r) => setTimeout(r, 200));
     await server.clearModprobeCalls();
 
-    // Fire several uploads inside the debounce window.
-    await Promise.all([
-      uploadFile(server.url, "", "a.gcode", "1"),
-      uploadFile(server.url, "", "b.gcode", "2"),
-      uploadFile(server.url, "", "c.gcode", "3"),
-    ]);
+    const r = await fetch(server.url + "/api/sync", { method: "POST" });
+    expect(r.status).toBe(200);
+    const s = (await r.json()) as { pending: boolean; changes: number };
+    expect(s.pending).toBe(false);
+    expect(s.changes).toBe(0);
 
-    await server.awaitModprobeCall(2000);
-    await new Promise((r) => setTimeout(r, 400)); // let any further cycles land
     const calls = await server.readModprobeCalls();
-    // One unload + one load = 2 lines per cycle. Coalesced = exactly 2.
-    expect(calls.length).toBe(2);
-    expect(calls.filter((l) => l.startsWith("-r ")).length).toBe(1);
-    expect(calls.filter((l) => l.startsWith("g_mass_storage ")).length).toBe(1);
+    expect(calls).toContain("-r g_mass_storage");
+    expect(calls.some((l) => l.startsWith("g_mass_storage "))).toBe(true);
+  });
+
+  test("the pending flag survives a restart (persisted on disk)", async () => {
+    server = await startServer();
+    await uploadFile(server.url, "", "a.gcode", "x");
+    await new Promise((r) => setTimeout(r, 200));
+    // Restart the app against the same root + state file; gadget is "already
+    // loaded" from the first run's view... but off-Pi /sys/module is absent, so
+    // it reloads and clears. Instead assert the state FILE itself holds pending.
+    const raw = await readFile(server.stateFile, "utf8");
+    expect(JSON.parse(raw).pending).toBe(true);
+  });
+
+  test("dev mode (no driver) still clears pending on sync", async () => {
+    server = await startServer({ driver: "" });
+    await uploadFile(server.url, "", "a.gcode", "x");
+    await new Promise((r) => setTimeout(r, 200));
+    expect((await getStatus(server.url)).pending).toBe(true);
+
+    await fetch(server.url + "/api/sync", { method: "POST" });
+    expect((await getStatus(server.url)).pending).toBe(false);
+    expect(await server.readModprobeCalls()).toEqual([]);
+  });
+});
+
+describe("system junk files", () => {
+  test("are hidden from listings and excluded from the file count", async () => {
+    server = await startServer();
+    await uploadFile(server.url, "", "real.gcode", "x");
+    // Lay down macOS metadata directly on the drive.
+    await writeFile(join(server.root, ".DS_Store"), "junk");
+    await writeFile(join(server.root, "._real.gcode"), "junk");
+    await mkdir(join(server.root, ".Spotlight-V100"), { recursive: true });
+
+    const list = (await (await fetch(server.url + "/api/list")).json()) as {
+      items: { name: string }[];
+    };
+    expect(list.items.map((i) => i.name)).toEqual(["real.gcode"]);
+
+    const s = (await (await fetch(server.url + "/api/status")).json()) as { files: number };
+    expect(s.files).toBe(1);
+  });
+
+  test("are deleted from the drive on sync", async () => {
+    server = await startServer();
+    await writeFile(join(server.root, ".DS_Store"), "junk");
+    await fetch(server.url + "/api/sync", { method: "POST" });
+    expect(existsSync(join(server.root, ".DS_Store"))).toBe(false);
   });
 });
 

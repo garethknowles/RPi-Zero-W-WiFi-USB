@@ -11,6 +11,9 @@ Type=simple
 EnvironmentFile=/etc/ankermanager.env
 # Runs as root: needs modprobe to load/unload the USB gadget and to bind port 80.
 ExecStart=/usr/local/bin/ankermanager
+# Creates /var/lib/ankermanager and exports it as $STATE_DIRECTORY. The app
+# persists the "changes await a sync" flag there so it survives restarts.
+StateDirectory=ankermanager
 Restart=on-failure
 RestartSec=3
 

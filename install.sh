@@ -3,8 +3,9 @@
 # install.sh — set up a Raspberry Pi Zero 2 W as a WiFi-managed USB drive for an
 # AnkerMake M5 (or similar USB-stick printer).
 #
-# It does the OS-level plumbing (USB gadget, FAT32 image, Samba) and installs the
+# It does the OS-level plumbing (USB gadget, FAT32 image) and installs the
 # single "ankermanager" app, which serves the web UI and replugs the USB gadget.
+# Files are managed only through that web UI — there is no network file share.
 #
 # Usage:
 #   sudo ./install.sh            # default, presents a plain USB stick (g_mass_storage)
@@ -50,9 +51,9 @@ append_once() {
 
 # ----- Steps ---------------------------------------------------------------
 install_packages() {
-  msg "Installing packages (samba, avahi, dosfstools, curl, unzip)"
+  msg "Installing packages (avahi, dosfstools, curl, unzip)"
   apt-get update
-  apt-get install -y samba samba-common-bin avahi-daemon dosfstools curl unzip
+  apt-get install -y avahi-daemon dosfstools curl unzip
 }
 
 enable_usb_gadget() {
@@ -115,22 +116,16 @@ EOF
   /sbin/iw dev wlan0 set power_save off 2>/dev/null || true
 }
 
-configure_samba() {
-  msg "Configuring the Samba [usb] share"
-  if ! grep -q '^\[usb\]' /etc/samba/smb.conf; then
-    cat >> /etc/samba/smb.conf <<EOF
-
-[usb]
-   browseable = yes
-   path = $MOUNT_DIR
-   guest ok = yes
-   read only = no
-   create mask = 777
-   directory mask = 777
-EOF
-    echo "    added [usb] share"
+remove_samba() {
+  # Earlier versions exposed the drive over a Samba [usb] share. We no longer
+  # use it: the web app is the sole writer, and a network share let macOS litter
+  # the drive with metadata (.DS_Store, .fseventsd, .Spotlight-V100, …) and
+  # risked two hosts writing the FAT at once. Make sure it isn't running.
+  if systemctl list-unit-files 2>/dev/null | grep -q '^smbd'; then
+    msg "Disabling Samba (no longer used by this project)"
+    systemctl disable --now smbd 2>/dev/null || true
+    systemctl disable --now nmbd 2>/dev/null || true
   fi
-  systemctl restart smbd
 }
 
 install_bun_and_build() {
@@ -198,7 +193,7 @@ enable_usb_gadget
 disable_wifi_powersave
 create_usb_image
 mount_usb_image
-configure_samba
+remove_samba
 install_bun_and_build
 write_env_file
 remove_old_watchdog

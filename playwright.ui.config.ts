@@ -26,7 +26,7 @@ export default defineConfig({
       FM_PORT: String(PORT),
       FM_HOST: "127.0.0.1",
       FM_DRIVER: "", // disable USB replug — UI tests don't care about it
-      FM_POLL_MS: "0",
+      FM_STATE_FILE: "/tmp/ankermgr-ui-sync.json",
     },
   },
   globalSetup: "./tests/ui/global-setup.ts",

@@ -5,21 +5,36 @@
  * One process does two jobs:
  *   1. Serves a small web UI + JSON API to manage the files on the virtual USB
  *      drive (list / upload / mkdir / delete / download).
- *   2. Acts as the USB "replug" watchdog: whenever files change — either through
- *      this app or through the Samba share — it unloads and reloads the USB
- *      mass-storage gadget so the printer re-reads the file list.
+ *   2. Owns the USB mass-storage gadget. USB Mass Storage is a block protocol
+ *      with no way to tell the printer "your cached file list is stale", so the
+ *      printer only re-reads the drive when the gadget is re-enumerated. We do
+ *      that — unload + reload the gadget — but ONLY when the user explicitly
+ *      asks (the "Sync to printer" button), because re-enumeration briefly
+ *      disconnects the drive and would abort an in-progress print. Until the
+ *      user syncs, changes are tracked as "pending", persisted on disk so the
+ *      flag survives page reloads, other clients, and app restarts.
+ *
+ * This app is the *only* writer to the drive (there is no Samba share), so it
+ * always knows when something changed — no filesystem watcher is needed.
  *
  * It only ever touches FM_ROOT (the loop-mounted FAT32 image, /mnt/usb_share).
  * All configuration comes from environment variables (see CONFIG below), which
  * on the Pi are provided by /etc/ankermanager.env via the systemd unit.
  */
 
-import { mkdir, readdir, rm, stat, statfs } from "node:fs/promises";
-import { watch } from "node:fs";
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
-import { basename, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 const run = promisify(execFile);
 
@@ -32,14 +47,18 @@ const CONFIG = {
   host: process.env.FM_HOST ?? "0.0.0.0",
   user: process.env.FM_USER ?? "",
   pass: process.env.FM_PASS ?? "",
-  // USB gadget settings. Empty driver disables replug (useful for local dev).
+  // USB gadget settings. Empty driver disables the gadget (useful for local dev).
   driver: process.env.FM_DRIVER ?? "g_mass_storage",
   usbImage: process.env.FM_USB_IMAGE ?? "/piusb.bin",
-  debounceMs: Number(process.env.FM_DEBOUNCE_MS ?? 5000),
-  // Backstop poll that catches changes fs.watch might miss (e.g. some Samba
-  // writes). 0 disables it. fs.watch is the primary mechanism.
-  pollMs: Number(process.env.FM_POLL_MS ?? 10000),
-  maxUploadBytes: Number(process.env.FM_MAX_UPLOAD_BYTES ?? 4 * 1024 * 1024 * 1024),
+  maxUploadBytes: Number(
+    process.env.FM_MAX_UPLOAD_BYTES ?? 4 * 1024 * 1024 * 1024,
+  ),
+  // Where the "changes await a sync" flag is persisted, so it survives page
+  // reloads, other clients and app restarts. MUST live outside `root` — it must
+  // never end up on the USB drive. systemd provides STATE_DIRECTORY.
+  stateFile:
+    process.env.FM_STATE_FILE ??
+    join(process.env.STATE_DIRECTORY ?? "/var/lib/ankermanager", "sync.json"),
 };
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
@@ -59,60 +78,107 @@ function safePath(rel: string | null | undefined): string {
 
 // FAT32-illegal characters and path separators are stripped from names.
 function safeName(name: string): string {
-  const base = basename(name).replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").trim();
-  if (!base || base === "." || base === "..") throw new HttpError(400, "invalid name");
+  const base = basename(name)
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, "_")
+    .trim();
+  if (!base || base === "." || base === "..")
+    throw new HttpError(400, "invalid name");
   return base;
 }
 
 class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
     super(message);
   }
 }
 
 // ---------------------------------------------------------------------------
-// USB replug — debounced + single-flight so rapid changes coalesce into one
-// unload/reload cycle and cycles never overlap.
+// System metadata junk — files that desktop OSes scatter onto removable
+// volumes (macOS Finder/Spotlight, Windows). We never show or count them, and
+// we delete them from the image so the printer's own file list stays clean.
 // ---------------------------------------------------------------------------
-const replugState = { inProgress: false, pending: false, lastAt: 0, lastReason: "" };
-let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+const JUNK_RE =
+  /^(\.DS_Store|\._.*|\.Spotlight-V100|\.fseventsd|\.Trashes|\.TemporaryItems|\.DocumentRevisions-V100|\.apdisk|\.metadata_never_index|\.VolumeIcon\.icns|System Volume Information)$/;
+const isJunk = (name: string): boolean => JUNK_RE.test(name);
 
-function scheduleReplug(reason: string) {
-  if (!CONFIG.driver) return; // disabled (dev mode)
-  replugState.lastReason = reason;
-  if (debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => {
-    debounceTimer = null;
-    void doReplug(reason);
-  }, CONFIG.debounceMs);
-}
-
-async function doReplug(reason: string) {
-  if (replugState.inProgress) {
-    replugState.pending = true;
-    return;
-  }
-  replugState.inProgress = true;
+// Recursively remove junk files/folders under `dir`; returns how many top-level
+// junk entries were removed. Tolerant of transient read errors.
+async function cleanJunk(dir: string): Promise<number> {
+  let removed = 0;
+  let entries;
   try {
-    log(`replug: reason=${reason} driver=${CONFIG.driver}`);
-    await modprobe(["-r", CONFIG.driver]).catch(() => {}); // ok if not loaded
-    await run("sync", []).catch(() => {});
-    await modprobe([
-      CONFIG.driver,
-      `file=${CONFIG.usbImage}`,
-      "stall=0",
-      "removable=1",
-    ]);
-    replugState.lastAt = Date.now();
-  } catch (err) {
-    log("replug failed:", (err as Error).message);
-  } finally {
-    replugState.inProgress = false;
-    if (replugState.pending) {
-      replugState.pending = false;
-      void doReplug("pending");
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) {
+    const full = resolve(dir, e.name);
+    if (isJunk(e.name)) {
+      await rm(full, { recursive: true, force: true }).catch(() => {});
+      removed++;
+    } else if (e.isDirectory()) {
+      removed += await cleanJunk(full);
     }
   }
+  return removed;
+}
+
+// ---------------------------------------------------------------------------
+// Sync state — tracks whether the drive holds changes the printer hasn't seen
+// yet. Persisted to disk so a page reload, a second browser, or an app restart
+// all agree on whether a "Sync to printer" is owed.
+// ---------------------------------------------------------------------------
+const sync = {
+  pending: false, // changes await a sync to the printer
+  changes: 0, // how many mutations since the last successful sync
+  pendingSince: 0, // epoch ms of the first change after a sync
+  inProgress: false, // a replug is running right now
+  lastSyncAt: 0, // epoch ms of the last successful sync
+  lastError: "", // message from the last failed sync, if any
+};
+
+async function persistState(): Promise<void> {
+  try {
+    await mkdir(dirname(CONFIG.stateFile), { recursive: true });
+    await writeFile(
+      CONFIG.stateFile,
+      JSON.stringify({
+        pending: sync.pending,
+        changes: sync.changes,
+        pendingSince: sync.pendingSince,
+        lastSyncAt: sync.lastSyncAt,
+      }),
+    );
+  } catch (err) {
+    log("could not persist sync state:", (err as Error).message);
+  }
+}
+
+async function restoreState(): Promise<void> {
+  try {
+    const d = JSON.parse(await readFile(CONFIG.stateFile, "utf8"));
+    sync.pending = !!d.pending;
+    sync.changes = d.changes ?? 0;
+    sync.pendingSince = d.pendingSince ?? 0;
+    sync.lastSyncAt = d.lastSyncAt ?? 0;
+  } catch {
+    /* no prior state — start clean */
+  }
+}
+
+// A mutation happened (upload/mkdir/delete): the drive now differs from what
+// the printer last read. Record it and let the UI surface the pending sync.
+function markChanged(reason: string): void {
+  sync.changes++;
+  if (!sync.pending) {
+    sync.pending = true;
+    sync.pendingSince = Date.now();
+  }
+  log(`change (${reason}); ${sync.changes} awaiting sync`);
+  void persistState();
 }
 
 function modprobe(args: string[]) {
@@ -122,46 +188,58 @@ function modprobe(args: string[]) {
   return run("sudo", ["modprobe", ...args]);
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem watcher — catches changes made outside the web app (Samba). The
-// app's own mutations call scheduleReplug() directly for instant feedback.
-// ---------------------------------------------------------------------------
-function startWatcher() {
-  if (!CONFIG.driver) return;
+// Is the gadget module currently loaded? Lets us tell a fresh boot (load it,
+// printer reads current contents → in sync) from an app-only restart (leave it
+// alone so we don't interrupt a print; trust the persisted pending flag).
+async function isGadgetLoaded(): Promise<boolean> {
   try {
-    watch(CONFIG.root, { recursive: true }, () => scheduleReplug("fs-watch"));
-    log(`watching ${CONFIG.root} (recursive)`);
-  } catch (err) {
-    log("recursive fs.watch unavailable, relying on poll:", (err as Error).message);
-  }
-  if (CONFIG.pollMs > 0) {
-    let last = "";
-    setInterval(async () => {
-      try {
-        const sig = await treeSignature(CONFIG.root);
-        if (last && sig !== last) scheduleReplug("poll");
-        last = sig;
-      } catch {
-        /* ignore transient scan errors */
-      }
-    }, CONFIG.pollMs);
+    await stat(`/sys/module/${CONFIG.driver}`);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-// Cheap change signature: sorted "relpath:size:mtime" of every file.
-async function treeSignature(dir: string, prefix = ""): Promise<string> {
-  const out: string[] = [];
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      out.push("d:" + rel);
-      out.push(await treeSignature(resolve(dir, entry.name), rel));
-    } else {
-      const s = await stat(resolve(dir, entry.name));
-      out.push(`f:${rel}:${s.size}:${Math.round(s.mtimeMs)}`);
+// Present the drive to the printer (add the module). Idempotent: a modprobe of
+// an already-loaded module is a no-op, so this never interrupts a live mount.
+function loadGadget() {
+  return modprobe([
+    CONFIG.driver,
+    `file=${CONFIG.usbImage}`,
+    "stall=0",
+    "removable=1",
+  ]);
+}
+
+// The explicit "Sync to printer": unload + reload the gadget so the printer
+// re-enumerates and re-reads the FAT. This briefly disconnects the drive, so it
+// only ever runs on direct user request — never automatically. Single-flight.
+async function doSync(): Promise<void> {
+  if (sync.inProgress) return;
+  sync.inProgress = true;
+  sync.lastError = "";
+  try {
+    const removed = await cleanJunk(CONFIG.root);
+    if (removed) log(`sync: removed ${removed} system metadata file(s)`);
+    await run("sync", []).catch(() => {}); // flush writes to the image first
+    if (CONFIG.driver) {
+      log(`sync: replugging ${CONFIG.driver}`);
+      await modprobe(["-r", CONFIG.driver]).catch(() => {}); // ok if not loaded
+      await run("sync", []).catch(() => {});
+      await loadGadget();
     }
+    sync.pending = false;
+    sync.changes = 0;
+    sync.pendingSince = 0;
+    sync.lastSyncAt = Date.now();
+  } catch (err) {
+    sync.lastError = (err as Error).message;
+    log("sync failed:", sync.lastError);
+    throw new HttpError(500, `sync failed: ${sync.lastError}`);
+  } finally {
+    sync.inProgress = false;
+    await persistState();
   }
-  return out.sort().join("|");
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +274,9 @@ function checkAuth(req: Request): boolean {
 // ---------------------------------------------------------------------------
 async function apiList(url: URL): Promise<Response> {
   const dir = safePath(url.searchParams.get("path"));
-  const entries = await readdir(dir, { withFileTypes: true });
+  const entries = (await readdir(dir, { withFileTypes: true })).filter(
+    (e) => !isJunk(e.name),
+  );
   const items = await Promise.all(
     entries.map(async (e) => {
       const s = await stat(resolve(dir, e.name)).catch(() => null);
@@ -209,7 +289,9 @@ async function apiList(url: URL): Promise<Response> {
     }),
   );
   // Folders first, then alphabetical.
-  items.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
+  items.sort((a, b) =>
+    a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1,
+  );
   return json({ items });
 }
 
@@ -217,18 +299,21 @@ async function apiUpload(url: URL, req: Request): Promise<Response> {
   const dir = safePath(url.searchParams.get("path"));
   await stat(dir); // 404s via catch in handler if missing
   const form = await req.formData();
-  const files = form.getAll("files").filter((f): f is File => f instanceof File);
+  const files = form
+    .getAll("files")
+    .filter((f): f is File => f instanceof File);
   if (files.length === 0) throw new HttpError(400, "no files");
   const saved: string[] = [];
   for (const file of files) {
-    if (file.size > CONFIG.maxUploadBytes) throw new HttpError(413, `${file.name} too large`);
+    if (file.size > CONFIG.maxUploadBytes)
+      throw new HttpError(413, `${file.name} too large`);
     const target = resolve(dir, safeName(file.name));
     safePath(target.slice(CONFIG.root.length)); // re-validate
     await Bun.write(target, file);
     saved.push(safeName(file.name));
   }
   await run("sync", []).catch(() => {});
-  scheduleReplug("upload");
+  markChanged("upload");
   return json({ saved });
 }
 
@@ -237,7 +322,7 @@ async function apiMkdir(req: Request): Promise<Response> {
   const parent = safePath(body.path);
   const target = resolve(parent, safeName(body.name ?? ""));
   await mkdir(target, { recursive: false });
-  scheduleReplug("mkdir");
+  markChanged("mkdir");
   return json({ ok: true });
 }
 
@@ -247,7 +332,7 @@ async function apiDelete(req: Request): Promise<Response> {
   if (target === CONFIG.root) throw new HttpError(400, "cannot delete root");
   await rm(target, { recursive: true, force: true });
   await run("sync", []).catch(() => {});
-  scheduleReplug("delete");
+  markChanged("delete");
   return json({ ok: true });
 }
 
@@ -283,14 +368,25 @@ async function apiStatus(): Promise<Response> {
     total,
     files,
     driver: CONFIG.driver,
-    syncing: replugState.inProgress || debounceTimer !== null,
-    lastReplugAt: replugState.lastAt,
+    pending: sync.pending,
+    changes: sync.changes,
+    pendingSince: sync.pendingSince,
+    syncing: sync.inProgress,
+    lastSyncAt: sync.lastSyncAt,
+    error: sync.lastError,
   });
+}
+
+// Explicit "Sync to printer" — replug the gadget, then report fresh status.
+async function apiSync(): Promise<Response> {
+  await doSync();
+  return apiStatus();
 }
 
 async function countFiles(dir: string): Promise<number> {
   let n = 0;
   for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (isJunk(e.name)) continue;
     if (e.isDirectory()) n += await countFiles(resolve(dir, e.name));
     else n++;
   }
@@ -323,32 +419,87 @@ const server = Bun.serve({
 
     try {
       if (url.pathname === "/" || url.pathname === "/index.html") {
-        return new Response(INDEX_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+        return new Response(INDEX_HTML, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
       }
-      if (url.pathname === "/api/list" && req.method === "GET") return await apiList(url);
-      if (url.pathname === "/api/upload" && req.method === "POST") return await apiUpload(url, req);
-      if (url.pathname === "/api/mkdir" && req.method === "POST") return await apiMkdir(req);
-      if (url.pathname === "/api/delete" && req.method === "POST") return await apiDelete(req);
-      if (url.pathname === "/api/download" && req.method === "GET") return await apiDownload(url);
-      if (url.pathname === "/api/status" && req.method === "GET") return await apiStatus();
+      if (url.pathname === "/api/list" && req.method === "GET")
+        return await apiList(url);
+      if (url.pathname === "/api/upload" && req.method === "POST")
+        return await apiUpload(url, req);
+      if (url.pathname === "/api/mkdir" && req.method === "POST")
+        return await apiMkdir(req);
+      if (url.pathname === "/api/delete" && req.method === "POST")
+        return await apiDelete(req);
+      if (url.pathname === "/api/download" && req.method === "GET")
+        return await apiDownload(url);
+      if (url.pathname === "/api/status" && req.method === "GET")
+        return await apiStatus();
+      if (url.pathname === "/api/sync" && req.method === "POST")
+        return await apiSync();
       return new Response("Not found", { status: 404 });
     } catch (err) {
-      if (err instanceof HttpError) return json({ error: err.message }, err.status);
+      if (err instanceof HttpError)
+        return json({ error: err.message }, err.status);
       const e = err as NodeJS.ErrnoException;
       if (e.code === "ENOENT") return json({ error: "not found" }, 404);
       if (e.code === "EEXIST") return json({ error: "already exists" }, 409);
-      log("request error:", e.message);
-      return json({ error: "internal error" }, 500);
+      log("request error:", e.code ?? "", e.message);
+      // This is a LAN-only tool, so surface the real reason — "internal error"
+      // is useless for debugging. Friendly text for the FAT32 mishaps we expect.
+      const friendly: Record<string, string> = {
+        EROFS: "the drive is mounted read-only (remount it read-write)",
+        EACCES: "permission denied",
+        EPERM: "operation not permitted",
+        EBUSY: "the file is in use (is the printer reading it?)",
+        ENOSPC: "the drive is full",
+        EIO: "disk I/O error (the FAT32 image may be corrupt — run fsck)",
+      };
+      const reason = (e.code && friendly[e.code]) ?? e.message ?? "internal error";
+      return json({ error: e.code ? `${reason} (${e.code})` : reason }, 500);
     }
   },
 });
 
-log(`ankermanager listening on http://${CONFIG.host}:${server.port}  root=${CONFIG.root}`);
+log(
+  `ankermanager listening on http://${CONFIG.host}:${server.port}  root=${CONFIG.root}`,
+);
 if (!CONFIG.user) log("WARNING: FM_USER unset — web UI has no authentication");
 
-// Initial replug on startup so the drive is presented to the printer, then watch.
-scheduleReplug("startup");
-startWatcher();
+void startup();
+
+// On startup, present the drive and reconcile the pending-sync flag.
+//   • Gadget not loaded (fresh boot) → load it. The printer mounts the image
+//     fresh and reads current contents, so nothing is pending.
+//   • Gadget already loaded (the app restarted while the gadget kept running,
+//     possibly mid-print) → leave it alone and trust the persisted flag. We
+//     must NOT replug here: that would interrupt a print in progress.
+async function startup(): Promise<void> {
+  await restoreState();
+  if (!CONFIG.driver) {
+    log("FM_DRIVER empty — USB gadget disabled (dev mode)");
+    return;
+  }
+  const removed = await cleanJunk(CONFIG.root).catch(() => 0);
+  if (removed) log(`removed ${removed} system metadata file(s) from the drive`);
+
+  if (await isGadgetLoaded()) {
+    log(
+      `USB gadget already loaded; ${
+        sync.pending ? `${sync.changes} change(s) awaiting sync` : "in sync"
+      }`,
+    );
+    return;
+  }
+  log("USB gadget not loaded — presenting the drive to the printer");
+  await loadGadget().catch((e) =>
+    log("initial gadget load failed:", (e as Error).message),
+  );
+  sync.pending = false;
+  sync.changes = 0;
+  sync.pendingSince = 0;
+  await persistState();
+}
 
 // ---------------------------------------------------------------------------
 // Frontend — single inline page, vanilla JS, no build step.
@@ -381,6 +532,8 @@ const INDEX_HTML = /* html */ `<!doctype html>
   .icon { width:1.1em; display:inline-block; }
   #status { font-size:.8rem; color:#888; margin-top:.6rem; display:flex; gap:1rem; flex-wrap:wrap; }
   #sync { color: var(--accent); }
+  .pending { color:#c80; font-weight:600; }
+  button#syncBtn[disabled] { opacity:.5; cursor:default; }
   progress { width:100%; height:.5rem; }
   a.dl { color: var(--accent); text-decoration:none; }
   .danger { color:#d33; }
@@ -393,6 +546,7 @@ const INDEX_HTML = /* html */ `<!doctype html>
     <span style="flex:1"></span>
     <button id="mkdirBtn">📁 New folder</button>
     <button class="primary" id="pickBtn">⬆️ Upload</button>
+    <button id="syncBtn" title="Push file changes to the printer">🔄 Sync to printer</button>
     <input type="file" id="file" multiple hidden>
   </div>
   <div id="drop">Drag &amp; drop files here to upload</div>
@@ -401,7 +555,7 @@ const INDEX_HTML = /* html */ `<!doctype html>
     <thead><tr><th>Name</th><th class="size">Size</th><th>Modified</th><th></th></tr></thead>
     <tbody id="list"></tbody>
   </table>
-  <p class="muted">Tip: avoid changing files during an active print — the printer streams from the drive, and a replug mid-job could interrupt it.</p>
+  <p class="muted">Uploads, deletes and new folders are saved instantly, but the printer keeps showing its old file list until you press <b>Sync to printer</b> — which briefly disconnects the USB drive. Only sync when no print is running.</p>
   <div id="status"></div>
 
 <script>
@@ -447,13 +601,31 @@ async function refresh() {
 async function status() {
   try {
     const s = await api("/api/status");
+    let state;
+    if (s.syncing) state = '<span id="sync">🔄 syncing to printer…</span>';
+    else if (s.pending) state = '<span class="pending">⚠️ ' + s.changes + ' change' + (s.changes === 1 ? '' : 's') + ' not yet on the printer — press “Sync to printer”</span>';
+    else state = '<span>✅ printer up to date</span>';
     $("status").innerHTML =
       '<span>📦 ' + fmtSize(s.free) + ' free of ' + fmtSize(s.total) + '</span>' +
-      '<span>🗂️ ' + s.files + ' files</span>' +
-      (s.syncing ? '<span id="sync">🔄 syncing to printer…</span>' : '<span>✅ in sync</span>');
-    if (s.syncing) setTimeout(status, 1500);
+      '<span>🗂️ ' + s.files + ' files</span>' + state;
+    // Highlight the Sync button only when there's something to push.
+    $("syncBtn").classList.toggle("primary", !!s.pending && !s.syncing);
+    $("syncBtn").disabled = !!s.syncing;
+    if (s.syncing) setTimeout(status, 1000);
   } catch {}
 }
+
+$("syncBtn").onclick = async () => {
+  if (!confirm(
+    "Sync to printer now?\\n\\n" +
+    "This briefly disconnects and reconnects the USB drive so the printer re-reads its files.\\n\\n" +
+    "⚠️ Do NOT do this while a print is running — it will interrupt the print."
+  )) return;
+  $("syncBtn").disabled = true;
+  try { await api("/api/sync", { method: "POST" }); }
+  catch (e) { alert("Sync failed: " + e.message); }
+  status();
+};
 
 async function del(path, isDir) {
   if (!confirm("Delete " + (isDir ? "folder (and contents)" : "file") + ":\\n" + path + " ?")) return;
