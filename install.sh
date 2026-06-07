@@ -3,8 +3,9 @@
 # install.sh — set up a Raspberry Pi Zero 2 W as a WiFi-managed USB drive for an
 # AnkerMake M5 (or similar USB-stick printer).
 #
-# It does the OS-level plumbing (USB gadget, FAT32 image, Samba) and installs the
+# It does the OS-level plumbing (USB gadget, FAT32 image) and installs the
 # single "ankermanager" app, which serves the web UI and replugs the USB gadget.
+# Files are managed only through that web UI — there is no network file share.
 #
 # Usage:
 #   sudo ./install.sh            # default, presents a plain USB stick (g_mass_storage)
@@ -50,9 +51,9 @@ append_once() {
 
 # ----- Steps ---------------------------------------------------------------
 install_packages() {
-  msg "Installing packages (samba, avahi, dosfstools, curl, unzip)"
+  msg "Installing packages (avahi, dosfstools, curl, unzip)"
   apt-get update
-  apt-get install -y samba samba-common-bin avahi-daemon dosfstools curl unzip
+  apt-get install -y avahi-daemon dosfstools curl unzip
 }
 
 enable_usb_gadget() {
@@ -84,27 +85,47 @@ mount_usb_image() {
   msg "Mounting $USB_IMAGE at $MOUNT_DIR"
   mkdir -p "$MOUNT_DIR"
   chmod 777 "$MOUNT_DIR"
-  # passno 0 = don't fsck on boot (avoids the "not a device" warning).
-  append_once "$USB_IMAGE $MOUNT_DIR vfat loop,users,umask=000,noatime 0 0" /etc/fstab
+  # nofail = don't block boot if this mount fails; passno 0 = skip fsck.
+  append_once "$USB_IMAGE $MOUNT_DIR vfat loop,nofail,users,umask=000,noatime 0 0" /etc/fstab
   mountpoint -q "$MOUNT_DIR" || mount "$MOUNT_DIR"
 }
 
-configure_samba() {
-  msg "Configuring the Samba [usb] share"
-  if ! grep -q '^\[usb\]' /etc/samba/smb.conf; then
-    cat >> /etc/samba/smb.conf <<EOF
+# Disable WiFi power-save so the Pi stays reliably reachable. The Broadcom chip
+# on a Pi Zero 2 W can drop into a power-save state from which it doesn't fully
+# recover, manifesting as "Pi disappears from the network after reboot".
+disable_wifi_powersave() {
+  msg "Disabling WiFi power-save (one-shot systemd unit)"
+  local unit="/etc/systemd/system/wifi-powersave-off.service"
+  cat > "$unit" <<'EOF'
+[Unit]
+Description=Disable WiFi power-save on wlan0
+After=network-online.target
+Wants=network-online.target
 
-[usb]
-   browseable = yes
-   path = $MOUNT_DIR
-   guest ok = yes
-   read only = no
-   create mask = 777
-   directory mask = 777
+[Service]
+Type=oneshot
+ExecStart=/sbin/iw dev wlan0 set power_save off
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
-    echo "    added [usb] share"
+  systemctl daemon-reload
+  systemctl enable wifi-powersave-off.service
+  # Try it now; ignore failure (e.g. wlan0 not up yet).
+  /sbin/iw dev wlan0 set power_save off 2>/dev/null || true
+}
+
+remove_samba() {
+  # Earlier versions exposed the drive over a Samba [usb] share. We no longer
+  # use it: the web app is the sole writer, and a network share let macOS litter
+  # the drive with metadata (.DS_Store, .fseventsd, .Spotlight-V100, …) and
+  # risked two hosts writing the FAT at once. Make sure it isn't running.
+  if systemctl list-unit-files 2>/dev/null | grep -q '^smbd'; then
+    msg "Disabling Samba (no longer used by this project)"
+    systemctl disable --now smbd 2>/dev/null || true
+    systemctl disable --now nmbd 2>/dev/null || true
   fi
-  systemctl restart smbd
 }
 
 install_bun_and_build() {
@@ -169,9 +190,10 @@ echo "  Web port  : $WEB_PORT"
 
 install_packages
 enable_usb_gadget
+disable_wifi_powersave
 create_usb_image
 mount_usb_image
-configure_samba
+remove_samba
 install_bun_and_build
 write_env_file
 remove_old_watchdog
@@ -182,9 +204,9 @@ msg "Done!"
 echo "    Open the web UI at:  http://$HOSTNAME_LOCAL/   (or http://<pi-ip>/)"
 echo "    Connect the Pi's micro-USB DATA port to the printer's USB-C port."
 echo
-read -rp "Reboot now to finish enabling the USB gadget? (y/N): " ans
-if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
-  reboot
-else
-  echo "Remember to reboot later: sudo reboot"
-fi
+echo "    !! IMPORTANT — before rebooting: open a SECOND ssh session to this Pi"
+echo "       NOW. If WiFi doesn't come back after the reboot, that session will"
+echo "       still let you in (or at least let you confirm the issue isn't your"
+echo "       client). Then come back here and press Enter."
+read -rp "Press Enter when ready to reboot (or Ctrl-C to skip reboot): " _
+reboot

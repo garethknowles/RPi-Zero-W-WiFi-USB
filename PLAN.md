@@ -1,5 +1,16 @@
 # PLAN — AnkerMake M5 WiFi File Manager on a Pi Zero 2 W (TypeScript / Bun)
 
+> **⚠️ Superseded in two places — this doc is the original design.** Two
+> decisions below have since changed; the README and code are authoritative:
+> 1. **No Samba.** The web UI is the only writer to the drive. References to a
+>    Samba `[usb]` share and the **fs watcher / debounced auto-replug** that
+>    existed to catch external (Samba) writes no longer apply — there's nothing
+>    external to watch, so there's no watcher.
+> 2. **Replug is manual, not automatic.** Re-enumerating the USB mid-print would
+>    abort the job, so mutations are saved immediately and marked *pending*
+>    (persisted on disk); the replug only happens when the user presses
+>    **Sync to printer**. The `POST /api/sync` endpoint does it.
+
 A plan to add a **browser-based file manager** (view / delete / create folders /
 drag-and-drop upload) on top of this repo's existing "Pi-as-USB-stick" setup, so
 you can manage the files your **AnkerMake M5** reads from USB without ever
@@ -44,11 +55,8 @@ program that serves the web UI, watches the folder, and does the replug.
   image already uses). Treat exFAT as unconfirmed — don't rely on it. Our virtual
   stick enumerates as a standard USB mass-storage device, so the M5 should accept
   it like any FAT32 drive.
-- **Keep printable files in the ROOT of the drive.** Whether the M5 browses
-  **sub-folders** is unconfirmed and printers of this class commonly list only the
-  root. So: keep things you want to print in the drive root; use folders only for
-  your own archiving. **Verify on first run** — this changes nothing in the code,
-  only how you organise files.
+- **Sub-folders work.** Confirmed on the actual printer — the M5 browses
+  sub-folders fine, so organise files however you like.
 - FAT32 limits: 4 GB max per file (irrelevant for gcode); total capacity is the
   image size — we'll default this to **~50 GB** (see §7), so you'll want a
   **64 GB or larger SD card**.
@@ -58,12 +66,8 @@ program that serves the web UI, watches the folder, and does the replug.
 |---|---|---|
 | M5 uses a **USB-C** host port; no USB-A / no SD slot | **High** | Multiple independent reviews (Tom's Hardware, All3DP, TechRadar) |
 | Prints `.gcode`; AnkerMake Studio also makes `.acode` | **High** | AnkerMake docs/slicer + user confirmation |
-| Drive should be **FAT32** | **Medium** | No source confirmed exFAT; FAT32 is the universal default and already used here |
-| Printable files must be in the **root** | **Medium/Low** | Not officially confirmed; common for this printer class — **verify physically** |
-
-> Note: the official AnkerMake support articles (Salesforce-hosted) could not be
-> fetched programmatically in this environment, so the two **Medium/Low** items
-> above should be confirmed on the actual printer during Phase 5.
+| Drive should be **FAT32** | **High** | Confirmed working on the real printer (this build) |
+| **Sub-folders** browsable on the printer | **High** | Confirmed on the real printer (this build) — earlier guess that it might be root-only was wrong |
 
 ---
 
@@ -302,8 +306,8 @@ the Pi — *not* the "PWR" port). So the link is:
   (the default here) — mirrors the repo's existing troubleshooting note.
 - **USB-C cabling/power (M5-specific):** see §6.1 — needs a USB-C↔micro-USB cable
   and VBUS isolation; don't assume the printer's USB-C port can power the Pi.
-- **Unverified printer behaviour:** filesystem (FAT32 assumed) and root-only file
-  listing are **Medium/Low confidence** (§1.1) — confirm in Phase 5.
+- **Printer behaviour confirmed:** the M5 reads our FAT32 virtual stick as-is
+  and browses sub-folders fine (see §1.1).
 - **Security:** Basic Auth + LAN-only. Never port-forward it.
 - **mDNS on Windows:** needs Bonjour (often already present); else use the IP.
 
@@ -323,12 +327,9 @@ the Pi — *not* the "PWR" port). So the link is:
       idempotent bash per §5.6) — 50 GB sparse image, installs Bun, `bun build
       --compile`, installs `ankermanager.service` + Avahi, prompts for credentials;
       **removes** the old `usbshare.py` + `usbshare.service`.
-- [ ] **Phase 5 — On-Pi validation:** flash 64-bit OS, install, attach to the M5
-      via the USB-C cable (§6.1), confirm a dropped file prints and that
-      delete/mkdir reflect on the printer, and that a Samba-saved file also
-      triggers a replug. **Also verify the two unknowns from §1.1:** (a) does the
-      M5 read **FAT32** as-is, and (b) does it list files only in the **root** or
-      also in **sub-folders**?  *(Requires physical hardware.)*
+- [x] **Phase 5 — On-Pi validation:** flashed 64-bit OS, installed, attached to
+      the M5. Confirmed: FAT32 virtual stick reads cleanly, sub-folders are
+      browsable on the printer, web UI works over WiFi.
 - [x] **Phase 6 — Docs:** `README.md` updated (64-bit OS note, web-app section,
       `http://<hostname>.local/` URL, USB-C cabling, Python steps removed).
 

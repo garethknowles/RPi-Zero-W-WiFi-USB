@@ -22,8 +22,27 @@ it shows up on the printer.
 | `/piusb.bin` | A large (default **50 GB**, sparse) file, formatted **FAT32**, that *is* the "USB stick" |
 | `g_mass_storage` USB gadget | Presents `/piusb.bin` to the printer over the Pi's micro-USB **data** port |
 | `/mnt/usb_share` | The same image loop-mounted on the Pi so files can be read/written |
-| **`ankermanager`** | A single self-contained app (TypeScript, built with [Bun](https://bun.sh)) that serves the **web UI** *and* "replugs" the virtual USB whenever files change, so the printer re-reads them |
-| Samba `[usb]` share | Optional: also exposes `/mnt/usb_share` as a network drive (`\\<pi>\usb`) |
+| **`ankermanager`** | A single self-contained app (TypeScript, built with [Bun](https://bun.sh)) that serves the **web UI** *and* "replugs" the virtual USB on demand, so the printer re-reads the files |
+
+The web UI is the **only** way files reach the drive — there's no network share.
+That keeps a single writer on the FAT32 image and means nothing litters the drive
+with desktop metadata.
+
+### Why "Sync to printer" is a button, not automatic
+
+USB Mass Storage is a **block-level** protocol: the printer runs its own FAT32
+driver and caches the directory listing. There is no message in the protocol for
+the Pi to say "your cache is stale", so the printer keeps showing its old file
+list until the USB device is **re-enumerated** (unplugged and replugged) — just
+like physically moving a stick from your laptop to the printer. `ankermanager`
+does that re-enumeration in software when you press **Sync to printer**.
+
+It's a deliberate button rather than automatic because re-enumeration briefly
+disconnects the drive, and doing that **mid-print would abort the job** (the
+printer streams gcode straight off the drive). Only you know when it's safe, so
+uploads/deletes are saved immediately but marked *pending* until you sync. The
+pending flag is stored on the Pi, so it's correct even after a page reload or
+from another device.
 
 `ankermanager` replaces the older Python watchdog — it's one binary, one systemd
 service, no Python. See [`PLAN.md`](PLAN.md) for the full design and rationale.
@@ -77,16 +96,24 @@ sudo ./install.sh
 
 The script will:
 
-1. Install packages (Samba, Avahi/mDNS, dosfstools).
+1. Install packages (Avahi/mDNS, dosfstools).
 2. Enable the USB gadget driver (`dwc2`).
 3. Create the **50 GB sparse** FAT32 image and loop-mount it at `/mnt/usb_share`.
-4. Configure the optional Samba share.
+4. Disable Samba if a previous install left it running (the web UI is the only
+   file interface now).
 5. Install **Bun** and build the `ankermanager` binary to `/usr/local/bin`.
 6. Prompt you for a **web username/password**.
 7. Install and start **`ankermanager.service`** (auto-starts on every boot).
 
 If your printer doesn't like the default gadget, re-run with the composite
 driver: `sudo ./install.sh g_multi` (see [Troubleshooting](#troubleshooting)).
+
+> **Tip — keep an SSH-over-USB escape hatch.** Passing `g_multi` makes the Pi
+> present **mass storage + a USB ethernet adapter + a serial console** all at
+> once. The ethernet adapter means you can SSH into the Pi over the USB cable
+> even when WiFi is misbehaving — invaluable for debugging. The tradeoff is
+> some printers refuse the composite gadget; if yours does, fall back to the
+> default `g_mass_storage`.
 
 ### 3. Connect to the printer
 
@@ -110,12 +137,13 @@ After the installer reboots the Pi, open:
 http://ankermake.local/      (or http://<pi-ip>/)
 ```
 
-Log in, then **drag & drop** a `.gcode`/`.acode` file. Within ~10–15 seconds it
-appears on the printer's USB menu.
+Log in, then **drag & drop** a `.gcode`/`.acode` file — it's saved instantly.
+When you're ready (and **not** mid-print), press **Sync to printer**; a few
+seconds later the file appears on the printer's USB menu.
 
-> **AnkerMake M5 note:** keep printable files in the **root** of the drive — the
-> M5 may not browse sub-folders. Use folders only for your own archiving, and
-> avoid changing files during an active print.
+> **AnkerMake M5 note:** sub-folders are browsable on the printer, so organise
+> as you like. Never press **Sync to printer** during an active print — the
+> printer streams from the drive, and the replug would interrupt the job.
 
 ---
 
@@ -125,8 +153,9 @@ appears on the printer's USB menu.
 - **Upload** by drag & drop or the Upload button (with a progress bar).
 - **New folder** and **Delete** (files or whole folders).
 - **Download** a file back to your computer.
-- A status bar shows free space and a "syncing to printer…" indicator after a
-  change.
+- **Sync to printer** pushes pending changes to the printer (replug). A status
+  bar shows free space, file count, and whether changes are still pending or the
+  printer is up to date.
 
 It's protected by HTTP Basic Auth (set during install). **Keep it on your LAN —
 do not port-forward it to the internet.**
@@ -142,7 +171,7 @@ Settings live in `/etc/ankermanager.env` (read by the systemd service):
 | `FM_DRIVER` | `g_mass_storage` | USB gadget driver (`g_mass_storage` or `g_multi`) |
 | `FM_USB_IMAGE` | `/piusb.bin` | The FAT32 image file |
 | `FM_USER` / `FM_PASS` | — | Web login (empty `FM_USER` disables auth) |
-| `FM_DEBOUNCE_MS` | `5000` | Wait after a change before replugging the USB |
+| `FM_STATE_FILE` | `/var/lib/ankermanager/sync.json` | Where the pending-sync flag is persisted |
 
 After editing it: `sudo systemctl restart ankermanager`.
 
